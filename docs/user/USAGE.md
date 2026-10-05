@@ -66,9 +66,14 @@ app0/
     <app resources>
     sce_module/
         <converted modules>
+addcont/
+    <entitlement label>/
+        <add-on content>
 ```
 
 Use `sce_modules/` or `prx/` instead of `sce_module/` if that is the input directory name. Relinker preserves each module's directory under `app0/` and prints its exact path. Place app resources in `app0/` separately. Copy the built system libraries from `build/core/libs/libs/*.prx` into `libs/`; use libraries built for the target OS. A custom `--rpath` changes the system library location.
+
+Installed add-on content goes in `addcont/`, one directory per entitlement label (letters and digits); `sceAppContentAddcontMount` mounts it at `/addcont<N>`. The title sees an add-on as owned only if its label is listed, one per line, in `anyps5-entitlements.ini` beside the executable or in the file `ANYPS5_ENTITLEMENTS` names.
 
 Linux:
 

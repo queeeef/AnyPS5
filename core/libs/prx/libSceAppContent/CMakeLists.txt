@@ -1,0 +1,21 @@
+add_library(libSceAppContent SHARED EXCLUDE_FROM_ALL Export.cpp)
+target_include_directories(libSceAppContent PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libSceAppContent)
+
+if(MINGW)
+    foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)
+        string(REPLACE "${runtimeLinkFlag}" "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+    endforeach()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(guest_appcontent_addcont_tests ${LIBS_INCLUDE_DIR}/tests/GuestAppContentAddcont.cpp)
+    target_include_directories(guest_appcontent_addcont_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_appcontent_addcont_tests PRIVATE libSceAppContent libc)
+    configure_windows_unwind(guest_appcontent_addcont_tests)
+    add_test(NAME guest_appcontent_addcont COMMAND guest_appcontent_addcont_tests)
+    if(WIN32)
+        set_tests_properties(guest_appcontent_addcont PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAppContent>")
+    endif()
+endif()
