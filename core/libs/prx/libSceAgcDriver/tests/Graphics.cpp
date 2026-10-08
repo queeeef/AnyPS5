@@ -522,6 +522,20 @@ void ComputeScratchTests() {
     Require(back.request.context.compute->scratchDwords == 24u, "the compute scratch size did not survive serialization");
 }
 
+void VertexUserDataTailTests() {
+    constexpr std::size_t userDataBytes = offsetof(ShaderUserData, sharp_resource_count) + sizeof(ShaderUserData::sharp_resource_count);
+    static_assert(userDataBytes < sizeof(ShaderUserData));
+    alignas(8) std::array<std::byte, sizeof(Shader) + sizeof(ShaderUserData)> memory{};
+    const auto headerAddress = reinterpret_cast<std::uint64_t>(memory.data());
+    Shader agc{};
+    agc.user_data = reinterpret_cast<ShaderUserData*>(memory.data() + sizeof(Shader));
+    std::memcpy(memory.data(), &agc, sizeof(Shader));
+    const std::span<const std::byte> header(memory.data(), sizeof(Shader) + userDataBytes);
+    const auto vertex = AgcDriver::Graphics::DecodeVertexStageInfo(header, headerAddress, {}, nullptr, true);
+    Require(!vertex.fetchEmbedded, "a vertex shader without direct resources fetched embedded attributes");
+    expectFailure([&] { static_cast<void>(AgcDriver::Graphics::DecodeVertexStageInfo(header.first(header.size() - 1), headerAddress, {}, nullptr, true)); }, "outside the registered shader header");
+}
+
 void PixelInputLayoutTests() {
     using ShaderRecompiler::PixelInput;
     using ShaderRecompiler::PixelInputVgpr;
@@ -2770,6 +2784,7 @@ int main() {
         TuningFieldTests();
         PixelInputLayoutTests();
         ComputeScratchTests();
+        VertexUserDataTailTests();
         InitialContextTests();
         pushConstantTests();
         resourceTests();
