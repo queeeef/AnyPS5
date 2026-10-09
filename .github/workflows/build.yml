@@ -93,6 +93,9 @@ jobs:
         include:
           - os: ubuntu-latest
             compiler: g++
+          - os: ubuntu-latest
+            compiler: g++
+            sanitizers: address,undefined
           - os: windows-latest
             compiler: g++
           - os: macos-latest
@@ -120,7 +123,7 @@ jobs:
           7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
       - if: runner.os == 'Windows'
         run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
-      - run: cmake -S . -B build-relinker -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON
+      - run: cmake -S . -B build-relinker -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON -DANYPS5_SANITIZERS=${{ matrix.sanitizers }}
       - run: cmake --build build-relinker --parallel 3
       - run: ctest --test-dir build-relinker --output-on-failure --timeout 120
 

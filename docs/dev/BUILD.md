@@ -67,6 +67,7 @@ Build configuration parameters:
 | `-DCMAKE_C_COMPILER_LAUNCHER=ccache`   | Optional C compiler cache; requires `ccache`.                      |
 | `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache` | Optional C++ compiler cache; requires `ccache`.                    |
 | `-DFFMPEG_PREBUILT_DIR=<path>`         | Unpacked FFmpeg package for the target platform; empty by default. |
+| `-DANYPS5_SANITIZERS=<checks>`         | `-fsanitize=` checks for every target, such as `address,undefined`; empty by default. Requires `-DANYPS5_RELINKER_ONLY=ON` and links the executables dynamically. |
 
 SDL and FreeType settings forced by the root `CMakeLists.txt` cannot be overridden with `-D`.
 

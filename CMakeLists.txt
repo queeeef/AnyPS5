@@ -10,6 +10,14 @@ endfunction()
 
 option(BUILD_TESTING "Build and register relinker tests" OFF)
 option(ANYPS5_RELINKER_ONLY "Build the relinker without system libraries or third-party dependencies" OFF)
+set(ANYPS5_SANITIZERS "" CACHE STRING "Comma-separated -fsanitize= checks to build every target with, for example address,undefined")
+if(NOT ANYPS5_SANITIZERS STREQUAL "")
+    if(NOT ANYPS5_RELINKER_ONLY)
+        message(FATAL_ERROR "ANYPS5_SANITIZERS requires ANYPS5_RELINKER_ONLY")
+    endif()
+    add_compile_options(-fsanitize=${ANYPS5_SANITIZERS} -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${ANYPS5_SANITIZERS})
+endif()
 if(BUILD_TESTING)
     enable_testing()
     if(MINGW)
@@ -30,7 +38,7 @@ add_compile_definitions(APS5_ENABLE_TIMING_LOG=$<BOOL:${APS5_ENABLE_TIMING_LOG}>
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NOT APPLE)
+if(NOT APPLE AND ANYPS5_SANITIZERS STREQUAL "")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
 endif()
 
