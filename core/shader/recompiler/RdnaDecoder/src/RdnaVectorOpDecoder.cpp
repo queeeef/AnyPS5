@@ -1892,6 +1892,7 @@ bool supportsNativeVop3SourceModifiers(RdnaOpcode opcode) {
         case RdnaOpcode::VMulF16:
         case RdnaOpcode::VMinF16:
         case RdnaOpcode::VMaxF16:
+        case RdnaOpcode::VFmacF16:
         case RdnaOpcode::VMacF32:
         case RdnaOpcode::VMadF32:
         case RdnaOpcode::VMadLegacyF32:
@@ -1940,6 +1941,7 @@ bool supportsNativeVop3ResultModifiers(RdnaOpcode opcode) {
         case RdnaOpcode::VMadF32:
         case RdnaOpcode::VFmaF32:
         case RdnaOpcode::VFmaF16:
+        case RdnaOpcode::VFmacF16:
         case RdnaOpcode::VAddF16:
         case RdnaOpcode::VSubF16:
         case RdnaOpcode::VSubrevF16:
@@ -2040,6 +2042,12 @@ void checkNativeVop3Modifiers(RdnaOpcode opcode, bool permlane, bool carryInOut,
     }
     if (opcode == RdnaOpcode::VLdexpF16) {
         if ((abs & ~1u) != 0u || opSel != 0u || (neg & ~1u) != 0u) {
+            throw std::invalid_argument("VOP3 source modifiers are not implemented");
+        }
+        return;
+    }
+    if (opcode == RdnaOpcode::VFmacF16) {
+        if ((abs & ~0x3u) != 0u || opSel != 0u || (neg & ~0x3u) != 0u) {
             throw std::invalid_argument("VOP3 source modifiers are not implemented");
         }
         return;
