@@ -992,7 +992,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
     APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
     Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
-    if (state.rectList) Require(draw.indexCount % 3 == 0, "incomplete rect-list primitive");
+    if (state.rectList && draw.indexCount % 3 != 0) {
+        char text[320];
+        std::snprintf(text, sizeof(text), "AGC graphics: incomplete rect-list primitive (count %u indexed %d indexSize %u indexAddress 0x%llx instances %u firstVertex %u firstInstance %u flags 0x%x color %d 0x%llx %ux%u render %ux%u)", draw.indexCount, draw.indexed ? 1 : 0, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), draw.instanceCount, draw.firstVertex, draw.firstInstance, draw.flags, state.hasColorTarget ? 1 : 0, static_cast<unsigned long long>(state.color.address), state.color.extent.width, state.color.extent.height, state.renderExtent.width, state.renderExtent.height);
+        throw std::runtime_error(text);
+    }
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders");
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
@@ -1779,7 +1783,18 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+std::optional<Pm4::DrawParameters> RectListTrimmed(const State& state, const Pm4::DrawParameters& draw) {
+    if (!state.rectList || draw.indirect || draw.indexCount % 3 == 0) return std::nullopt;
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1) < 4) std::fprintf(stderr, "[local-workaround] rect-list draw of %u vertices x %u instances drops its last %u vertices\n", draw.indexCount, draw.instanceCount, draw.indexCount % 3);
+    auto trimmed = draw;
+    trimmed.indexCount -= draw.indexCount % 3;
+    return trimmed;
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& drawIn, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+    const auto trimmedDraw = RectListTrimmed(state, drawIn);
+    const Pm4::DrawParameters& draw = trimmedDraw ? *trimmedDraw : drawIn;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
@@ -2329,7 +2344,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& drawIn, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+    const auto trimmedDraw = RectListTrimmed(state, drawIn);
+    const Pm4::DrawParameters& draw = trimmedDraw ? *trimmedDraw : drawIn;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
