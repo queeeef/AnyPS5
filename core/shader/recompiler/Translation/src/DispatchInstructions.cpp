@@ -3,6 +3,7 @@
 #include "Recompiler.hpp"
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -13,7 +14,33 @@ void DispatchInstruction(IrBuilder& builder, const RdnaInstruction& instruction,
     throw std::runtime_error("DispatchInstruction not implemented");
 }
 
+extern std::uint64_t g_localIrValuesCreated;
+
+namespace {
+struct LocalIrHistogram {
+    std::uint64_t count[4096]{};
+    std::uint64_t values[4096]{};
+    ~LocalIrHistogram() {
+        if (std::getenv("APS5_LOCAL_IR_HISTOGRAM") == nullptr) return;
+        for (int op = 0; op < 4096; ++op) {
+            if (count[op] != 0) std::fprintf(stderr, "[ir-histogram] %d %llu %llu\n", op, static_cast<unsigned long long>(count[op]), static_cast<unsigned long long>(values[op]));
+        }
+    }
+};
+LocalIrHistogram g_localIrHistogram;
+struct LocalIrCharge {
+    int op;
+    std::uint64_t start = g_localIrValuesCreated;
+    ~LocalIrCharge() {
+        if (op < 0 || op >= 4096) return;
+        ++g_localIrHistogram.count[op];
+        g_localIrHistogram.values[op] += g_localIrValuesCreated - start;
+    }
+};
+}
+
 void TranslationContext::TranslateInstruction(const RdnaInstruction& decoded) {
+    const LocalIrCharge localIrCharge{static_cast<int>(decoded.op)};
     RdnaInstruction instruction = decoded;
     instruction.destination = destinationOperand(decoded);
     currentOpcode = instruction.op;

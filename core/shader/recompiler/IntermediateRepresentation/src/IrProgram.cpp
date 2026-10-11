@@ -246,7 +246,10 @@ IrBlock& IrProgram::CreateBlock() {
     return created;
 }
 
+std::uint64_t g_localIrValuesCreated = 0;
+
 IrValue& IrProgram::CreateValue(IrOpcode opcode, IrType type) {
+    ++g_localIrValuesCreated;
     auto value = std::make_unique<IrValue>(opcode, type, nextValueId);
     nextValueId++;
     IrValue& created = *value;

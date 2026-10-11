@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -20,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver::Graphics { std::unordered_map<std::uint64_t, const char*>& LocalNoteTags(); std::unordered_map<std::uint64_t, std::uint64_t>& LocalNotePrograms(); }
 namespace AgcDriver::Graphics {
 namespace {
 
@@ -714,6 +716,13 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    static std::atomic<int> localReports{0};
+    if (std::getenv("APS5_LOCAL_KEY_WAIT_TRACE") != nullptr && localReports.fetch_add(1) < 12) {
+        std::string text = "[local-keywait] surface 0x" + std::to_string(resource.baseAddress) + " " + std::to_string(resource.width) + "x" + std::to_string(resource.height) + " fmt " + std::to_string(resource.format) + " guestBytes " + std::to_string(guestBytes) + " keys [" + std::to_string(metaAddress) + "+" + std::to_string(count) + ")";
+        for (const auto& write : recorder->PendingWritesOver(metaAddress, count)) text += " write [" + std::to_string(write.begin) + "," + std::to_string(write.end) + ") len " + std::to_string(write.end - write.begin) + " note " + std::to_string(write.note) + " value " + std::to_string(write.value) + " by " + [&] { const auto found = LocalNoteTags().find(write.note); return std::string(found == LocalNoteTags().end() ? "untagged" : found->second); }() + " program " + std::to_string(LocalNotePrograms()[write.note]) + " packet 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%x", GuestMemory::CurrentPacket().opcode); return std::string(text); }();
+        if (const auto info = recorder->DescribePendingWrite(metaAddress, count)) text += " | newest batch range [" + std::to_string(info->rangeBegin) + "," + std::to_string(info->rangeEnd) + ") open " + std::to_string(info->open);
+        std::fprintf(stderr, "%s\n", text.c_str());
+    }
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
     return std::nullopt;

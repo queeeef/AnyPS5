@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -31,6 +32,10 @@
 #include <tuple>
 
 namespace AgcDriver::Graphics {
+const char*& LocalWriteTag();
+std::unordered_map<std::uint64_t, const char*>& LocalNoteTags();
+std::unordered_map<std::uint64_t, std::uint64_t>& LocalNotePrograms();
+std::uint64_t& LocalProgram();
 
 namespace {
 
@@ -2575,6 +2580,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    if (LocalWriteTag() != nullptr) { LocalNoteTags()[writeNoteCount] = LocalWriteTag(); LocalNotePrograms()[writeNoteCount] = LocalProgram(); }
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
@@ -2613,6 +2619,26 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
     std::lock_guard tableLock(labelTableMutex);
     // A dword overlaps the range when it starts before the end and ends after the start.
     for (auto it = labels.lower_bound(address >= 3 ? address - 3 : 0); it != labels.end() && it->first < end; ++it) it->second.overwritten = true;
+}
+
+const char*& LocalWriteTag() {
+    thread_local const char* tag = nullptr;
+    return tag;
+}
+
+std::unordered_map<std::uint64_t, const char*>& LocalNoteTags() {
+    static std::unordered_map<std::uint64_t, const char*> tags;
+    return tags;
+}
+
+std::uint64_t& LocalProgram() {
+    thread_local std::uint64_t program = 0;
+    return program;
+}
+
+std::unordered_map<std::uint64_t, std::uint64_t>& LocalNotePrograms() {
+    static std::unordered_map<std::uint64_t, std::uint64_t> programs;
+    return programs;
 }
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {

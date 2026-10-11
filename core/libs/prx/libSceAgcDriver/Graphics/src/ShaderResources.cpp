@@ -34,6 +34,7 @@
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
 
+namespace AgcDriver::Graphics { const char*& LocalWriteTag(); }
 namespace AgcDriver::Graphics {
 namespace {
 
@@ -3494,7 +3495,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     guestMemory.RecordCopyBacks(recorder);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
+    LocalWriteTag() = "shader-guest-writes";
     recorder.NotePendingWrites(guestMemory.Writes());
+    LocalWriteTag() = nullptr;
     guestMemory.MarkDirectWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();

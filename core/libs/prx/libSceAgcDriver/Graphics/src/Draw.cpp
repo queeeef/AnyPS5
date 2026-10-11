@@ -34,6 +34,7 @@
 #include <unordered_map>
 #include <utility>
 
+namespace AgcDriver::Graphics { const char*& LocalWriteTag(); }
 namespace AgcDriver::Graphics {
 
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews) {
@@ -249,7 +250,9 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     const auto commands = recorder.Commands();
     recorder.Keep(resident);
     context.detiler->DispatchCmaskClear(commands, import.buffer, address - import.base, bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
+    LocalWriteTag() = "cmask-clear";
     recorder.NotePendingWrite(address, bytes);
+    LocalWriteTag() = nullptr;
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }
 

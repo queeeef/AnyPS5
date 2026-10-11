@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <utility>
 
+namespace AgcDriver::Graphics { const char*& LocalWriteTag(); }
 namespace AgcDriver::Graphics {
 
 namespace {
@@ -2730,7 +2731,9 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         recorder->MarkCovered(storedAccess);
         // Only the pieces written into the import are stores a CPU reader must wait for; the
         // shadowed ones reach it through a publish, which notes its own.
+        LocalWriteTag() = "texture-imported";
         if (!imported.empty()) recorder->NotePendingWrites(imported);
+        LocalWriteTag() = nullptr;
     }
     partialWriteBacks.fetch_add(1, std::memory_order_relaxed);
     partialWriteBackBytes.fetch_add(storedBytes, std::memory_order_relaxed);
@@ -4167,7 +4170,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
             recorder->MarkShaderReadsCovered();
+            LocalWriteTag() = "storage-writeback";
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            LocalWriteTag() = nullptr;
         }
         countStorageWriteBack(storedBytes, true);
         if (profile) Profile().storageGpu += timer.lap();
