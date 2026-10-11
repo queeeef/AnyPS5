@@ -9,6 +9,9 @@
 #include <fstream>
 #include <source_location>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #ifdef __linux__
 #include <cerrno>
 #include <unistd.h>
@@ -64,11 +67,25 @@ int main() {
     Require(close_nid_postfix(descriptor) == 0);
     Require(fstatfs_nid_postfix(-1, viaPublic) == -1 && Error() == 9);
     char buffer[64];
+    for (const auto& component : {std::string("missing"), std::string("file.txt")}) {
+        const auto prefix = root.generic_string() + "/" + component + "/../";
+        const auto invalid = prefix + "file.txt";
+        const auto created = prefix + "new.txt";
+        const int expected = component == "missing" ? 2 : 20;
+        Require(readlink_nid_postfix(invalid.c_str(), buffer, sizeof(buffer)) == -1 && Error() == expected);
+        Require(link_nid_postfix(invalid.c_str(), created.c_str()) == -1 && Error() == expected);
+        Require(link_nid_postfix(file.c_str(), created.c_str()) == -1 && Error() == expected);
+        Require(symlink_nid_postfix("file.txt", created.c_str()) == -1 && Error() == expected);
+        Require(std::filesystem::hard_link_count(file) == 1 && !std::filesystem::exists(root / "new.txt"));
+    }
     Require(readlink_nid_postfix(file.c_str(), buffer, sizeof(buffer)) == -1 && Error() == 22);
     Require(readlink_nid_postfix(root.string().c_str(), buffer, sizeof(buffer)) == -1 && Error() == 22);
     Require(readlink_nid_postfix((root / "missing").string().c_str(), buffer, sizeof(buffer)) == -1 && Error() == 2);
     Require(readlink_nid_postfix("", buffer, sizeof(buffer)) == -1 && Error() == 2);
     Require(readlink_nid_postfix(nullptr, buffer, sizeof(buffer)) == -1 && Error() == 14);
+#ifndef _WIN32
+    Require(readlink_nid_postfix((root / std::string(300, 'n')).string().c_str(), buffer, sizeof(buffer)) == -1 && Error() == 63);
+#endif
     std::error_code error;
     const auto link = (root / "link").string();
     std::filesystem::create_symlink("sub/target.txt", link, error);
@@ -82,6 +99,11 @@ int main() {
         Require(readlink_nid_postfix(link.c_str(), nullptr, 0) == 0);
         Require(readlink_nid_postfix(link.c_str(), nullptr, sizeof(buffer)) == -1 && Error() == 14);
         Require(readlink_nid_postfix((root / "LINK").string().c_str(), buffer, sizeof(buffer)) == 14);
+#ifndef _WIN32
+        std::filesystem::create_symlink("loopB", root / "loopA");
+        std::filesystem::create_symlink("loopA", root / "loopB");
+        Require(readlink_nid_postfix((root / "loopA" / "inner").string().c_str(), buffer, sizeof(buffer)) == -1 && Error() == 62);
+#endif
     } else {
         std::fprintf(stderr, "symbolic links unavailable: the link cases not tested\n");
     }
@@ -130,13 +152,22 @@ int main() {
     const auto symbolic = (root / "symbolic").string();
     const int created = symlink_nid_postfix("original.bin", symbolic.c_str());
     if (created == 0) {
+        const auto dangling = (root / "dangling").string();
+#ifdef _WIN32
+        Require((GetFileAttributesW(std::filesystem::path(symbolic).wstring().c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+        Require(symlink_nid_postfix("original.bin", symbolic.c_str()) == -1 && Error() == 17);
+        Require(symlink_nid_postfix("missing.bin", dangling.c_str()) == 0);
+        Require((GetFileAttributesW(std::filesystem::path(dangling).wstring().c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+        Require(symlink_nid_postfix("missing.bin", dangling.c_str()) == -1 && Error() == 17);
+#else
         Require(std::filesystem::is_symlink(std::filesystem::symlink_status(symbolic)));
         Require(readlink_nid_postfix(symbolic.c_str(), buffer, sizeof(buffer)) == 12 && std::memcmp(buffer, "original.bin", 12) == 0);
         Require(std::filesystem::file_size(symbolic) == std::filesystem::file_size(original));
         Require(symlink_nid_postfix("original.bin", symbolic.c_str()) == -1 && Error() == 17);
-        const auto dangling = (root / "dangling").string();
         Require(symlink_nid_postfix("missing.bin", dangling.c_str()) == 0);
         Require(readlink_nid_postfix(dangling.c_str(), buffer, sizeof(buffer)) == 11 && !std::filesystem::exists(dangling));
+        Require(symlink_nid_postfix("missing.bin", dangling.c_str()) == -1 && Error() == 17);
+#endif
     } else {
         Require(created == -1 && Error() == 1);
         std::fprintf(stderr, "symbolic links unavailable: the symlink success cases not tested\n");
