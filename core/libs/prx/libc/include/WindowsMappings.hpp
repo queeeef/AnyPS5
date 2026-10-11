@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBC_INCLUDE_WINDOWSMAPPINGS_HPP
 
 #ifdef _WIN32
+#include <chrono>
 #include <windows.h>
 #include <algorithm>
 #include <cstdio>
@@ -141,6 +142,11 @@ public:
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume shared memory write");
         view.armed = false;
+        ++resumedWrites;
+        if (++view.page->faults >= HotFaults) {
+            view.page->faults = 0;
+            view.page->hot = HotCollects;
+        }
         return true;
     }
 
@@ -218,6 +224,11 @@ public:
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
         std::lock_guard lock(mutex);
+        if (const auto now = std::chrono::steady_clock::now(); now - lastFaultReport >= std::chrono::seconds(10)) {
+            std::fprintf(stderr, "[write-faults] %llu resumed shared-page write faults in the last 10 s\n", static_cast<unsigned long long>(resumedWrites - reportedWrites));
+            reportedWrites = resumedWrites;
+            lastFaultReport = now;
+        }
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -238,7 +249,9 @@ public:
                 const auto stop = std::min(end, base + pageBytes);
                 if (view.protection == PAGE_NOACCESS) return false;
                 const bool pinned = view.page->pins != 0;
-                if (pinned || view.seen != view.page->generation) {
+                const bool written = view.seen != view.page->generation;
+                const bool hot = view.page->hot != 0;
+                if (pinned || hot || written) {
                     const auto needed = (stop - cursor + 4095) / 4096;
                     if (needed > capacity - *count) {
                         for (auto at = cursor; *count < capacity; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
@@ -247,6 +260,12 @@ public:
                     for (auto at = cursor; at < stop; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
                 }
                 if (clear && !pinned) {
+                    view.seen = view.page->generation;
+                    if (hot) --view.page->hot;
+                    if (view.page->hot != 0) {
+                        cursor = stop;
+                        continue;
+                    }
                     for (const auto alias : view.page->aliases) {
                         auto& other = views.at(alias);
                         if (!writable(other.protection) || other.armed || other.hostWrites != 0) continue;
@@ -255,7 +274,6 @@ public:
                         if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
                         other.armed = true;
                     }
-                    view.seen = view.page->generation;
                     rememberClean(base, base + pageBytes);
                 }
                 cursor = stop;
@@ -292,10 +310,17 @@ private:
     }
 
     static constexpr std::size_t pageBytes = 0x4000;
+    static constexpr std::uint32_t HotCollects = 256;
+    static constexpr std::uint32_t HotFaults = 4;
+    std::uint64_t resumedWrites = 0;
+    std::uint64_t reportedWrites = 0;
+    std::chrono::steady_clock::time_point lastFaultReport = std::chrono::steady_clock::now();
     struct SharedPage {
         std::uint64_t generation = 1;
         std::vector<std::uintptr_t> aliases;
         std::uint32_t pins = 0;
+        std::uint32_t hot = 0;
+        std::uint32_t faults = 0;
     };
     struct Section {
         HANDLE handle;
