@@ -1,6 +1,7 @@
 #include "Translation/FloatInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 
@@ -52,7 +53,8 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
     };
     const auto minMaxLane = [&](bool high) { return minMaxF16Bits(opcode == IrOpcode::FPMax32, laneBits(sourceAt(inst, 0u), high), laneBits(sourceAt(inst, 1u), high)); };
     IrU32 result = native ? nativeResult() : quietSnan ? packU16Lanes(minMaxLane(false), minMaxLane(true)) : packHalf2x16(translateLane(false), translateLane(true));
-    if (native || !inst.destination.clamp || !dx10Clamp() || quietSnan) {
+    static const bool localSkipSpecialValues = std::getenv("APS5_LOCAL_FAST_PKF16") == nullptr || std::atoi(std::getenv("APS5_LOCAL_FAST_PKF16")) >= 2;
+    if (!localSkipSpecialValues && (native || !inst.destination.clamp || !dx10Clamp() || quietSnan)) {
         const auto isNan = [&](const IrU32& bits) {
             return IrU1(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));
         };
