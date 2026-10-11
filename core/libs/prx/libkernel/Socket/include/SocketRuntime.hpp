@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 namespace GuestSockets {
-constexpr int FirstDescriptor = 0x10000000;
+constexpr int FirstDescriptor = 0x300;
 struct Iovec {
     void* base;
     std::size_t length;

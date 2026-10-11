@@ -103,6 +103,13 @@ int APS5_VABI inet_pton_nid_postfix(int af, const char* src, void* dst) {
 
 int* APS5_VABI __error_nid_postfix();
 
+struct SelectKernelPoll {
+    int descriptor;
+    short events;
+    short revents;
+};
+int APS5_VABI poll_nid_postfix(SelectKernelPoll* descriptors, std::uint32_t count, int timeout);
+
 void KernelSetSocketPoller_nid_no_patch(KernelSocketPoll::Poller poller) {
     g_socketPoller.store(poller);
 }
@@ -137,6 +144,8 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
     std::vector<std::size_t> hostSlots;
     std::vector<KernelSocketPoll::Entry> devices;
     std::vector<KernelSocketPoll::Entry> requested;
+    std::vector<SelectKernelPoll> kernel;
+    std::vector<std::size_t> kernelSlots;
     for (int descriptor = 0; descriptor < nfds; ++descriptor) {
         short events = 0;
         if (DescriptorSet(readfds, descriptor)) events |= KernelSocketPoll::Readable;
@@ -144,6 +153,11 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         if (DescriptorSet(exceptfds, descriptor)) events |= KernelSocketPoll::Urgent;
         if (events == 0) continue;
         if (File::IsRandomDevice(descriptor)) devices.push_back({descriptor, events, static_cast<short>(events & (KernelSocketPoll::Readable | KernelSocketPoll::Writable))});
+        else if (descriptor >= GuestSockets::FirstDescriptor && GuestSockets::IsOpen(descriptor)) {
+            kernel.push_back({descriptor, static_cast<short>(((events & KernelSocketPoll::Readable) ? 0x1 : 0) | ((events & KernelSocketPoll::Writable) ? 0x4 : 0)), 0});
+            kernelSlots.push_back(requested.size());
+            requested.push_back({descriptor, events, 0});
+        }
         else if (descriptor <= 2) devices.push_back({descriptor, events, static_cast<short>(descriptor == 0 ? 0 : events & KernelSocketPoll::Writable)});
         else {
             sockets.push_back({descriptor, events, 0});
@@ -206,6 +220,22 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
             waitMilliseconds = static_cast<int>(std::clamp<std::int64_t>(roundedMilliseconds, 0, 100));
         }
         if (devicesReady) waitMilliseconds = 0;
+        if (!kernel.empty()) {
+            for (auto& entry : kernel) entry.revents = 0;
+            if (poll_nid_postfix(kernel.data(), static_cast<std::uint32_t>(kernel.size()), 0) < 0) return -1;
+            bool kernelReady = false;
+            for (std::size_t index = 0; index < kernel.size(); ++index) {
+                const auto revents = kernel[index].revents;
+                short flags = 0;
+                if ((revents & (0x1 | 0x40)) != 0) flags |= KernelSocketPoll::Readable;
+                if ((revents & 0x4) != 0) flags |= KernelSocketPoll::Writable;
+                if ((revents & 0x8) != 0) flags |= KernelSocketPoll::Error;
+                if ((revents & 0x10) != 0) flags |= KernelSocketPoll::HangUp;
+                requested[kernelSlots[index]].revents = flags;
+                kernelReady = kernelReady || flags != 0;
+            }
+            waitMilliseconds = kernelReady ? 0 : std::min(waitMilliseconds, 1);
+        }
 #ifndef _WIN32
         if (!hosts.empty() && !sockets.empty()) {
             if (poller == nullptr) UnknownDescriptor(sockets.front().descriptor, false);
