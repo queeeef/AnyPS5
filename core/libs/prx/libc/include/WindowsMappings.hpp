@@ -261,7 +261,6 @@ public:
                 }
                 if (clear && !pinned) {
                     view.seen = view.page->generation;
-                    if (hot) --view.page->hot;
                     if (view.page->hot != 0) {
                         cursor = stop;
                         continue;
