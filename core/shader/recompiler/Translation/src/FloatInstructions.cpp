@@ -39,11 +39,15 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         if (high ? operand.negateHi : operand.negate) bits = IrU32(ir.BitwiseXor(bits.Value(), ir.Constant(0x8000u)));
         return bits;
     };
-    const bool native = nativeFloat16 && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32);
+    const bool native = nativeFloat16 && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32 || (nativeFloat16Fma && opcode == IrOpcode::FPFma32));
     const auto nativeResult = [&]() {
         const auto packed = [&](const RdnaOperand& operand) { return packU16Lanes(laneBits(operand, false), laneBits(operand, true)); };
         const IrU32 lhs = packed(sourceAt(inst, 0u));
         const IrU32 rhs = packed(sourceAt(inst, 1u));
+        if (opcode == IrOpcode::FPFma32) {
+            const IrU32 addend = packed(accumulator ? accumulatorOperand(inst) : sourceAt(inst, 2u));
+            return IrU32(ir.Emit(IrOpcode::FPFma16x2, IrType::U32, {&lhs.Value(), &rhs.Value(), &addend.Value()}));
+        }
         return IrU32(ir.Emit(opcode == IrOpcode::FPAdd32 ? IrOpcode::FPAdd16x2 : IrOpcode::FPMul16x2, IrType::U32, {&lhs.Value(), &rhs.Value()}));
     };
     IrU32 result = native ? nativeResult() : packHalf2x16(translateLane(false), translateLane(true));
