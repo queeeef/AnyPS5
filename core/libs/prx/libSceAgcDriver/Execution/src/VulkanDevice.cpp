@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Execution/include/SubgroupClock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentationGamma.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -348,6 +349,8 @@ struct VulkanDevice::State {
     std::shared_ptr<std::vector<std::shared_ptr<Graphics::ShaderResources>>> copiedWriters = std::make_shared<std::vector<std::shared_ptr<Graphics::ShaderResources>>>();
     VkPhysicalDeviceMeshShaderPropertiesEXT meshLimits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     std::unique_ptr<PresentationScaler> scaler;
+    std::unique_ptr<PresentationGamma> outputGamma;
+    bool swapchainTransferSource = false;
     // The swapchain image AcquireImage took for the next present(), consumed by that present.
     bool imageAcquired = false;
     std::uint32_t acquiredIndex = 0;
@@ -602,6 +605,7 @@ struct VulkanDevice::State {
         for (std::uint32_t y = 0; y < height; ++y) {
             for (std::uint32_t x = 0; x < width; ++x) std::memcpy(pixels.data() + (static_cast<std::size_t>(y) * width + x) * 4, full.data() + (static_cast<std::size_t>(y) * scale * slot.dumpWidth + static_cast<std::size_t>(x) * scale) * 4, 4);
         }
+        ApplyOutputGamma(pixels, OutputGamma());
         static const auto start = std::chrono::steady_clock::now();
         std::fprintf(stderr, "[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", index, slot.dumpWidth, slot.dumpHeight, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
         dumpWriter.Enqueue(index, width, height, 1, std::move(pixels));
@@ -685,6 +689,7 @@ struct VulkanDevice::State {
             detiler.reset();
             colorTransfer.reset();
             scaler.reset();
+            outputGamma.reset();
             pipelineCache.reset();
             context.bufferPool.reset();
             bufferPool.reset();
@@ -1630,7 +1635,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         swapchain.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         swapchain.imageExtent = state->extent;
         swapchain.imageArrayLayers = 1;
-        swapchain.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        state->swapchainTransferSource = (surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+        swapchain.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | (state->swapchainTransferSource ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -2309,7 +2315,8 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     create.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     create.imageExtent = {width, height};
     create.imageArrayLayers = 1;
-    create.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    state->swapchainTransferSource = (surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+    create.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | (state->swapchainTransferSource ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
     create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -2361,7 +2368,9 @@ void VulkanDevice::PresentPixels(std::uint32_t width, std::uint32_t height, std:
             std::fwrite(&magic, 2, 1, file);
             std::fwrite(&fileBytes, 4, 1, file);
             std::fwrite(header + 1, 4, 12, file);
-            std::fwrite(pixels.data(), 1, pixels.size(), file);
+            std::vector<std::byte> presented(pixels.begin(), pixels.end());
+            ApplyOutputGamma(presented, OutputGamma());
+            std::fwrite(presented.data(), 1, presented.size(), file);
             std::fclose(file);
         }
     }
@@ -2760,6 +2769,11 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             if (!slot.dumpBuffer || slot.dumpBuffer->Bytes().size() != dumpBytes) slot.dumpBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), dumpBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             (direct ? slot.dumpScaler : state->scaler)->RecordReadback(commands, slot.dumpBuffer->Handle());
         }
+    }
+    if (const auto gamma = OutputGamma(); !clearOnly && gamma != 1.0f) {
+        Graphics::Require(state->swapchainTransferSource, "the surface cannot apply the title's output gamma (no transfer-source swapchain images)");
+        if (!state->outputGamma) state->outputGamma = std::make_unique<PresentationGamma>(graphicsContext());
+        state->outputGamma->Record(commands, barrier.image, state->extent.width, state->extent.height, gamma);
     }
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = 0;

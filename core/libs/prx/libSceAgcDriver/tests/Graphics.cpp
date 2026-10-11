@@ -1,6 +1,7 @@
 #include "BdaTests.hpp"
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentationGamma.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -396,6 +397,16 @@ void setProxyVariable(const char* value) {
     if (*value == 0) unsetenv("APS5_SRGB_ATTACHMENT_PROXY");
     else setenv("APS5_SRGB_ATTACHMENT_PROXY", value, 1);
 #endif
+}
+
+void outputGammaTests() {
+    const std::array<std::byte, 8> source{std::byte{0}, std::byte{128}, std::byte{255}, std::byte{64}, std::byte{255}, std::byte{51}, std::byte{204}, std::byte{128}};
+    auto pixels = source;
+    AgcDriver::ApplyOutputGamma(pixels, 1.0f);
+    Require(pixels == source, "an output gamma of 1 changed the image");
+    AgcDriver::ApplyOutputGamma(pixels, 2.0f);
+    const std::array<std::byte, 8> squared{std::byte{0}, std::byte{64}, std::byte{255}, std::byte{64}, std::byte{255}, std::byte{10}, std::byte{163}, std::byte{128}};
+    Require(pixels == squared, "an output gamma of 2 did not square the color channels and keep alpha");
 }
 
 void srgb8TargetTests() {
@@ -4887,6 +4898,7 @@ int main(int argc, char** argv) {
         hdrComponentSwapTests();
         depthMaintenanceTests();
         hardwareScreenOffsetTests();
+        outputGammaTests();
         srgb8TargetTests();
         DepthClipTests();
         DepthStencilTests();
