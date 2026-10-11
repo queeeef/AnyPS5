@@ -103,4 +103,9 @@ void Publish(const MouseInputEvent& event) {
     enqueue(data);
 }
 
+bool IsOpen() {
+    std::lock_guard lock(mouseMutex);
+    return initialized && opened;
+}
+
 }

@@ -8,6 +8,8 @@ public:
     void HandleEvent(const SDL_Event& event, unsigned windowId);
 
 private:
+    void capture(bool enabled);
+
     bool focused = true;
 };
 

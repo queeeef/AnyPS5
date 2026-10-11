@@ -8,6 +8,7 @@ void MouseInput::HandleEvent(const SDL_Event& event, unsigned windowId) {
     switch (event.type) {
         case SDL_MOUSEMOTION:
             if (event.motion.windowID != windowId || !focused) return;
+            if (SDL_GetRelativeMouseMode() == SDL_FALSE && MouseIsOpen_nid_postfix()) capture(true);
             input.x = event.motion.xrel;
             input.y = event.motion.yrel;
             break;
@@ -36,12 +37,14 @@ void MouseInput::HandleEvent(const SDL_Event& event, unsigned windowId) {
             if (event.window.windowID != windowId) return;
             if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                 focused = false;
+                capture(false);
                 input.resetButtons = true;
             } else if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
                 focused = true;
                 input.connectionChange = true;
             } else if (event.window.event == SDL_WINDOWEVENT_CLOSE) {
                 focused = false;
+                capture(false);
                 input.connectionChange = true;
                 input.connected = false;
             } else {
@@ -52,4 +55,9 @@ void MouseInput::HandleEvent(const SDL_Event& event, unsigned windowId) {
             return;
     }
     MousePublishInput_nid_postfix(input);
+}
+
+void MouseInput::capture(bool enabled) {
+    if ((SDL_GetRelativeMouseMode() == SDL_TRUE) == enabled) return;
+    SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE);
 }
