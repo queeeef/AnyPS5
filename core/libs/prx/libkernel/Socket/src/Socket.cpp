@@ -5,6 +5,7 @@
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include "prx/libkernel/Socket/include/SocketSelectDeadline.hpp"
+#include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -55,6 +56,13 @@ int APS5_VABI inet_pton_nid_postfix(int af, const char* src, void* dst) {
 
 int* APS5_VABI __error_nid_postfix();
 
+struct SelectKernelPoll {
+    int descriptor;
+    short events;
+    short revents;
+};
+int APS5_VABI poll_nid_postfix(SelectKernelPoll* descriptors, std::uint32_t count, int timeout);
+
 void KernelSetSocketPoller_nid_no_patch(KernelSocketPoll::Poller poller) {
     g_socketPoller.store(poller);
 }
@@ -67,6 +75,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
     }
     std::vector<KernelSocketPoll::Entry> entries;
     std::vector<KernelSocketPoll::Entry> devices;
+    std::vector<SelectKernelPoll> kernel;
     for (int descriptor = 0; descriptor < nfds; ++descriptor) {
         short events = 0;
         if (DescriptorSet(readfds, descriptor)) events |= KernelSocketPoll::Readable;
@@ -74,6 +83,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         if (DescriptorSet(exceptfds, descriptor)) events |= KernelSocketPoll::Urgent;
         if (events == 0) continue;
         if (File::IsRandomDevice(descriptor)) devices.push_back({descriptor, events, static_cast<short>(events & (KernelSocketPoll::Readable | KernelSocketPoll::Writable))});
+        else if (descriptor >= GuestSockets::FirstDescriptor && GuestSockets::IsOpen(descriptor)) kernel.push_back({descriptor, static_cast<short>(((events & KernelSocketPoll::Readable) ? 0x1 : 0) | ((events & KernelSocketPoll::Writable) ? 0x4 : 0)), 0});
         else if (descriptor <= 2) devices.push_back({descriptor, events, static_cast<short>(descriptor == 0 ? 0 : events & KernelSocketPoll::Writable)});
         else entries.push_back({descriptor, events, 0});
     }
@@ -91,6 +101,17 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
             waitMilliseconds = static_cast<int>(std::clamp<std::int64_t>(roundedMilliseconds, 0, 100));
         }
         if (devicesReady) waitMilliseconds = 0;
+        int kernelReady = 0;
+        if (!kernel.empty()) {
+            const int polled = poll_nid_postfix(kernel.data(), static_cast<std::uint32_t>(kernel.size()), 0);
+            if (polled < 0) return -1;
+            for (const auto& entry : kernel) {
+                kernelReady += static_cast<int>((entry.events & 0x1) && (entry.revents & (0x1 | 0x8 | 0x10 | 0x20)));
+                kernelReady += static_cast<int>((entry.events & 0x4) && (entry.revents & (0x4 | 0x8 | 0x20)));
+            }
+            if (kernelReady > 0) waitMilliseconds = 0;
+            else waitMilliseconds = std::min(waitMilliseconds, 1);
+        }
         if (sockets != 0) {
             const auto poller = g_socketPoller.load();
             if (poller == nullptr) UnknownDescriptor(entries.front().descriptor, false);
@@ -103,7 +124,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         } else if (waitMilliseconds > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(waitMilliseconds));
         }
-        int ready = 0;
+        int ready = kernelReady;
         for (const auto& entry : entries) {
             if ((entry.revents & KernelSocketPoll::Unknown) != 0) UnknownDescriptor(entry.descriptor, true);
             const bool readable = (entry.events & KernelSocketPoll::Readable) != 0 && (entry.revents & (KernelSocketPoll::Readable | KernelSocketPoll::HangUp | KernelSocketPoll::Error)) != 0;
@@ -112,6 +133,11 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
             ready += static_cast<int>(readable) + static_cast<int>(writable) + static_cast<int>(urgent);
         }
         if (ready > 0) {
+            for (const auto& entry : kernel) {
+                if (!((entry.events & 0x1) && (entry.revents & (0x1 | 0x8 | 0x10 | 0x20)))) ClearDescriptor(readfds, entry.descriptor);
+                if (!((entry.events & 0x4) && (entry.revents & (0x4 | 0x8 | 0x20)))) ClearDescriptor(writefds, entry.descriptor);
+                ClearDescriptor(exceptfds, entry.descriptor);
+            }
             for (const auto& entry : entries) {
                 if ((entry.revents & (KernelSocketPoll::Readable | KernelSocketPoll::HangUp | KernelSocketPoll::Error)) == 0) ClearDescriptor(readfds, entry.descriptor);
                 if ((entry.revents & (KernelSocketPoll::Writable | KernelSocketPoll::Error)) == 0) ClearDescriptor(writefds, entry.descriptor);
@@ -120,6 +146,11 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
             return ready;
         }
         if (limit != nullptr && std::chrono::steady_clock::now() >= deadline) {
+            for (const auto& entry : kernel) {
+                ClearDescriptor(readfds, entry.descriptor);
+                ClearDescriptor(writefds, entry.descriptor);
+                ClearDescriptor(exceptfds, entry.descriptor);
+            }
             for (const auto& entry : entries) {
                 ClearDescriptor(readfds, entry.descriptor);
                 ClearDescriptor(writefds, entry.descriptor);
