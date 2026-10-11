@@ -10,6 +10,7 @@
   - libstdc++-6.dll
   - libwinpthread-1.dll
 - winpthreads initializes a statically initialized rwlock on its first lock and fails a concurrent first lock with `EINVAL`, which `std::shared_mutex` and `std::shared_timed_mutex` ignore, so that lock does not exclude. Guest rwlocks ([Pthread.hpp](../../core/libs/prx/libkernel/Pthread/include/Pthread.hpp)) are locked once when created. The host `std::shared_mutex` objects in [Recompiler.cpp](../../core/shader/recompiler/Recompiler.cpp) and [GuestWriteWatch.cpp](../../core/libs/prx/libc/src/GuestWriteWatch.cpp) are not, and can still race on their first contended use.
+- The `3rdparty/SPIRV-Headers` submodule predates `SPV_KHR_fma`, so [SpirvFma.hpp](../../core/shader/recompiler/SpirvFma.hpp) defines `OpFmaKHR` (4427) and the `FMAKHR` capability (6030) from the [SPIR-V registry](https://github.com/KhronosGroup/SPIRV-Registry/blob/main/extensions/KHR/SPV_KHR_fma.asciidoc) until the submodule is updated.
 
 ### Silent stubs
 
