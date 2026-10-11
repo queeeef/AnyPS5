@@ -707,6 +707,40 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
     return mixed || (value >= 0 && EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value))) == DccKeys::Uncompressed);
 }
 
+std::optional<DccKeys> PendingFillClearKeys(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count) {
+    const auto begin = resource.dccAddress;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
+    auto writes = recorder.PendingWritesOver(begin, count);
+    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
+    int value = -1;
+    for (const auto& write : writes) {
+        if (unwritten.empty()) break;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
+        bool covered = false;
+        for (const auto& [from, to] : unwritten) {
+            if (write.end <= from || to <= write.begin) {
+                rest.emplace_back(from, to);
+                continue;
+            }
+            covered = true;
+            if (from < write.begin) rest.emplace_back(from, write.begin);
+            if (write.end < to) rest.emplace_back(write.end, to);
+        }
+        unwritten = std::move(rest);
+        if (!covered) continue;
+        if (write.value < 0 || (value >= 0 && write.value != value)) return std::nullopt;
+        value = write.value;
+    }
+    if (value < 0) return std::nullopt;
+    for (const auto& [from, to] : unwritten) {
+        if (!AllKeysEqual(reinterpret_cast<const std::uint8_t*>(from), static_cast<std::size_t>(to - from), static_cast<std::uint8_t>(value))) return std::nullopt;
+    }
+    const auto keys = ByteKeys(static_cast<std::uint8_t>(value));
+    if (IsConvertedTextureFormat(resource.format) && (keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110)) return std::nullopt;
+    return EncodedKeys(resource, keys);
+}
+
 }
 
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -716,9 +750,10 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    if (const auto keys = PendingFillClearKeys(*recorder, resource, count)) return *keys;
     static std::atomic<int> localReports{0};
-    if (std::getenv("APS5_LOCAL_KEY_WAIT_TRACE") != nullptr && localReports.fetch_add(1) < 12) {
-        std::string text = "[local-keywait] surface 0x" + std::to_string(resource.baseAddress) + " " + std::to_string(resource.width) + "x" + std::to_string(resource.height) + " fmt " + std::to_string(resource.format) + " guestBytes " + std::to_string(guestBytes) + " keys [" + std::to_string(metaAddress) + "+" + std::to_string(count) + ")";
+    if (std::getenv("APS5_LOCAL_KEY_WAIT_TRACE") != nullptr && [&] { const auto n = localReports.fetch_add(1); return n < 4 || n % 500 == 0; }()) {
+        std::string text = "[local-keywait] surface 0x" + std::to_string(resource.baseAddress) + " " + std::to_string(resource.width) + "x" + std::to_string(resource.height) + " fmt " + std::to_string(resource.format) + " guestBytes " + std::to_string(guestBytes) + " keys [" + std::to_string(metaAddress) + "+" + std::to_string(count) + ") accessible " + std::to_string(GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count)) + " shadowed " + std::to_string(AnyShadowedOverlaps(metaAddress, count)) + " converted " + std::to_string(IsConvertedTextureFormat(resource.format));
         for (const auto& write : recorder->PendingWritesOver(metaAddress, count)) text += " write [" + std::to_string(write.begin) + "," + std::to_string(write.end) + ") len " + std::to_string(write.end - write.begin) + " note " + std::to_string(write.note) + " value " + std::to_string(write.value) + " by " + [&] { const auto found = LocalNoteTags().find(write.note); return std::string(found == LocalNoteTags().end() ? "untagged" : found->second); }() + " program " + std::to_string(LocalNotePrograms()[write.note]) + " packet 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%x", GuestMemory::CurrentPacket().opcode); return std::string(text); }();
         if (const auto info = recorder->DescribePendingWrite(metaAddress, count)) text += " | newest batch range [" + std::to_string(info->rangeBegin) + "," + std::to_string(info->rangeEnd) + ") open " + std::to_string(info->open);
         std::fprintf(stderr, "%s\n", text.c_str());
