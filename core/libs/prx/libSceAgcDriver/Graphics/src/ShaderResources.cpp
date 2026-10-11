@@ -834,11 +834,7 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes);
 
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
-    if (DepthStencilPlaneAt(viewed.baseAddress)) {
-        static std::atomic<int> reported{0};
-        if (reported.fetch_add(1) < 4) std::fprintf(stderr, "[local-workaround] storage access to the stencil plane at 0x%llx (%ux%u guest format %u) uses the guest memory, not the stencil aspect\n", static_cast<unsigned long long>(viewed.baseAddress), viewed.width, viewed.height, viewed.format);
-        return lookupStorageTexture(context, words, viewed, mip, guestBytes);
-    }
+    Require(!DepthStencilPlaneAt(viewed.baseAddress), "storage access to a depth surface's stencil plane is not implemented");
     auto texture = lookupStorageTexture(context, words, viewed, mip, guestBytes);
     if (DepthSurfaceAt(context, words, viewed)) SeedStorageFromDepth(context, texture);
     return texture;
