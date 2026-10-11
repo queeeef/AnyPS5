@@ -576,6 +576,10 @@ void TestResolveFailures() {
     Require(sceKernelAprResolveFilepathsToIdsAndFileSizesForEach(paths, 2, ids, sizes, results) == 1);
     Require(results[0] == 0 && results[1] == static_cast<int>(0x80020002));
     Require(ids[1] == 0xffffffffu && sizes[0] == 4 && sizes[1] == 0);
+    for (const char* invalid : {"ampr_resolve_missing.bin/../ampr_resolve_existing.bin", "ampr_resolve_existing.bin/../ampr_resolve_existing.bin"}) {
+        Require(sceKernelAprResolveFilepathsToIds(&invalid, 1, ids, &failed) == -1);
+        Require(*__error_nid_postfix() == 2 && failed == 0 && ids[0] == 0xffffffffu);
+    }
     std::remove(paths[0]);
 }
 
@@ -690,7 +694,7 @@ void TestAmmRangesAboveHintedMaps() {
     std::uintptr_t arenaBase = 0;
     std::size_t arenaBytes = 0;
     GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
-    Require(multimapEnd == arenaBase + arenaBytes);
+    Require(start >= arenaBase && multimapEnd <= arenaBase + arenaBytes && heap + 4 * step <= start);
 
     for (std::uint64_t hint = heap + step; hint < heap + 4 * step; hint += step) {
         void* mapped = reinterpret_cast<void*>(hint);

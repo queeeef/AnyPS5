@@ -22,6 +22,10 @@ struct RequestStatusRegistration {
 };
 static std::mutex g_statusMutex;
 static std::map<int, RequestStatusRegistration> g_statusCallbacks;
+struct HttpsCaList {
+    void* certs;
+    int certsNum;
+};
 
 extern "C" {
 
@@ -436,6 +440,22 @@ int APS5_VABI sceHttpSetRedirectCallback(int id, HttpRedirectCallback cbfunc, vo
 
 int APS5_VABI sceHttpAbortWaitRequest(void) {
     NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHttpsGetCaList(int http_ctx_id, HttpsCaList* ca_list) {
+    (void)http_ctx_id;
+    if (!ca_list) return ERROR_INVALID_VALUE;
+    ca_list->certs = nullptr;
+    ca_list->certsNum = 0;
+    return 0;
+}
+
+int APS5_VABI sceHttpsFreeCaList(int http_ctx_id, HttpsCaList* ca_list) {
+    (void)http_ctx_id;
+    if (!ca_list) return ERROR_INVALID_VALUE;
+    ca_list->certs = nullptr;
+    ca_list->certsNum = 0;
     return 0;
 }
 }

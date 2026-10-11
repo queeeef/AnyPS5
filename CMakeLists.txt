@@ -55,6 +55,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_comments.py)
         add_test(NAME test_registration COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_test_registration.py)
+        add_test(NAME check_skips COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_skips.py)
+        add_test(NAME stubgen COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_stubgen.py)
         add_test(NAME hardware_oracle COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/hw-oracle/test_hw_oracle.py)
         add_test(NAME pr_overlap_exports COMMAND ${Python3_EXECUTABLE}
@@ -89,6 +93,16 @@ if(NOT ANYPS5_USE_SYSTEM_DEPS)
     set(CMAKE_EXE_LINKER_FLAGS "")
     add_subdirectory(3rdparty/SDL2)
     set(CMAKE_EXE_LINKER_FLAGS "${ANYPS5_EXE_LINKER_FLAGS}")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        get_directory_property(ANYPS5_SDL_PIPEWIRE DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_PIPEWIRE)
+        get_directory_property(ANYPS5_SDL_PULSEAUDIO DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_PULSEAUDIO)
+        get_directory_property(ANYPS5_SDL_ALSA DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_ALSA)
+        if(NOT ANYPS5_SDL_PIPEWIRE AND NOT ANYPS5_SDL_PULSEAUDIO AND NOT ANYPS5_SDL_ALSA)
+            message(FATAL_ERROR "SDL found no PipeWire, PulseAudio or ALSA development files, so audio output would be silent. "
+                "Install libpipewire-0.3-dev, libpulse-dev and libasound2-dev (Debian, Ubuntu) "
+                "or pipewire-devel, pulseaudio-libs-devel and alsa-lib-devel (Fedora), then rerun configuration.")
+        endif()
+    endif()
 endif()
 set(ARCHITECTURE x86_64)
 add_subdirectory(3rdparty/ffmpeg-core)

@@ -51,15 +51,6 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
 // a storage image other than `except` has results pending in [address, address + bytes).
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except);
 
-// Per-device descriptor objects shared by ShaderResources builds: set layouts by their binding list
-// (immutable; kept until the device is torn down, which Vulkan allows even for pipeline layouts made
-// from them) and a chain of descriptor pools that sets are freed back to, so a build creates and
-// destroys no layout or pool of its own. A set lives exactly as long as its ShaderResources, which
-// its batch keeps until the GPU completed. The cache locks itself: stage A of a dispatch build
-// (ShaderResources::buildPrepare, from VulkanDevice::PrepareDispatch) takes layouts and sets from it
-// without GuestMemory::GpuMutex, while other threads free and update sets of the same pools under
-// that lock (Vulkan synchronizes the pool for allocate/free and the set for update, so that is
-// legal). APS5_NO_LAYOUT_CACHE=1 / APS5_NO_POOL_CACHE=1 restore the per-build objects.
 class DescriptorCache {
 public:
     explicit DescriptorCache(const Context& context);
@@ -73,6 +64,8 @@ public:
     struct SetAllocation {
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkDescriptorPool pool = VK_NULL_HANDLE;
+        std::size_t poolIndex = 0;
+        bool updateAfterBind = false;
     };
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false);
     void Free(const SetAllocation& allocation) noexcept;
@@ -90,11 +83,16 @@ private:
     Context context;
     PFN_vkDestroyDescriptorSetLayout destroyLayout;
     PFN_vkDestroyDescriptorPool destroyPool;
-    PFN_vkFreeDescriptorSets freeSets;
+    PFN_vkResetDescriptorPool resetPool;
     mutable std::mutex mutex;
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
-    std::vector<VkDescriptorPool> pools;
-    std::vector<VkDescriptorPool> updateAfterBindPools;
+    struct Pool {
+        VkDescriptorPool handle = VK_NULL_HANDLE;
+        std::size_t liveSets = 0;
+        bool exhausted = false;
+    };
+    std::vector<Pool> pools;
+    std::vector<Pool> updateAfterBindPools;
     std::vector<VkDescriptorPool> dedicated;
     Stats stats;
 };
@@ -138,6 +136,7 @@ public:
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
@@ -161,6 +160,7 @@ public:
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
+    bool HasCachedStorageImages() const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
     std::string Describe() const;
@@ -424,7 +424,7 @@ private:
     VkDescriptorSet _set = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // The cache pool the set was allocated from, freed back to it on release.
-    VkDescriptorPool cachePool = VK_NULL_HANDLE;
+    DescriptorCache::SetAllocation cacheAllocation;
     std::vector<Allocation> allocations;
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
@@ -436,6 +436,7 @@ private:
     std::uint64_t dispatchThreads = 0;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
+    std::vector<bool> textureBaseLevel;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<std::uint32_t> storageMips;
     std::vector<std::uint64_t> storageKeys;
@@ -524,6 +525,7 @@ public:
     // With `object`, erases the entry only while it still holds that object (a replacement made
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
+    void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);

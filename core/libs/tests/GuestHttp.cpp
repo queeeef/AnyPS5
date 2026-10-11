@@ -78,8 +78,19 @@ int main() {
     Require(sceHttpUriBuild(built, nullptr, required - 1, &element, buildAll) == outOfMemory);
     Require(sceHttpUriBuild(built, nullptr, sizeof(built), &element, buildAll) == 0);
     Require(Equal(built, "https://user:secret@example.com:8443/a/c?x=1&y=2#top"));
+    Require(sceHttpUriBuild(nullptr, &required, 0, &element, 0x01) == 0);
+    Require(required == sizeof("https://"));
+    std::memset(built, 'Z', sizeof(built));
+    Require(sceHttpUriBuild(built, nullptr, required - 1, &element, 0x01) == outOfMemory);
+    for (char c : built) Require(c == 'Z');
+    Require(sceHttpUriBuild(built, nullptr, required, &element, 0x01) == 0);
+    Require(Equal(built, "https://") && built[required] == 'Z');
+    Require(sceHttpUriBuild(built, nullptr, sizeof(built), &element, 0) == 0);
+    Require(Equal(built, "//"));
+    Require(sceHttpUriBuild(built, nullptr, sizeof(built), &element, 0x02) == 0);
+    Require(Equal(built, "//example.com"));
     Require(sceHttpUriBuild(built, nullptr, sizeof(built), &element, 0x08 | 0x40) == 0);
-    Require(Equal(built, "/a/c?x=1&y=2"));
+    Require(Equal(built, "///a/c?x=1&y=2"));
 
     Require(sceHttpUriParse(&element, "HTTP://Example.com/", pool, nullptr, sizeof(pool)) == 0);
     Require(element.port == 80 && Equal(element.username, "") && Equal(element.query, ""));
@@ -96,6 +107,10 @@ int main() {
     Require(Equal(element.username, "someone") && Equal(element.hostname, "example.com"));
     Require(sceHttpUriBuild(built, nullptr, sizeof(built), &element, buildAll) == 0);
     Require(Equal(built, "mailto:someone@example.com"));
+    Require(sceHttpUriBuild(built, nullptr, sizeof(built), &element, 0x01) == 0);
+    Require(Equal(built, "mailto:"));
+    Require(sceHttpUriBuild(built, nullptr, sizeof(built), &element, 0) == 0);
+    Require(Equal(built, ""));
 
     Require(sceHttpUriParse(&element, "/path/only?q", pool, nullptr, sizeof(pool)) == 0);
     Require(Equal(element.scheme, "") && Equal(element.hostname, "") && Equal(element.path, "/path/only"));

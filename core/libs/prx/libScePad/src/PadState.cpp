@@ -1,9 +1,11 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libScePad/include/Pad.hpp"
+#include "prx/libScePad/include/InputCommandFile.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <stdexcept>
@@ -107,15 +109,15 @@ void Pad::Initialize() {
 }
 
 namespace {
-PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uint64_t now) {
+PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uint64_t now, std::uint32_t injected) {
     PadData data{};
-    data.buttons = state.buttons;
+    data.buttons = state.buttons | injected;
     data.left_stick_x = state.sticks[0];
     data.left_stick_y = state.sticks[1];
     data.right_stick_x = state.sticks[2];
     data.right_stick_y = state.sticks[3];
-    data.analog_buttons_l2 = std::max<std::uint8_t>(state.analogButtonsL2, (state.buttons & 0x100) != 0 ? 255 : 0);
-    data.analog_buttons_r2 = std::max<std::uint8_t>(state.analogButtonsR2, (state.buttons & 0x200) != 0 ? 255 : 0);
+    data.analog_buttons_l2 = std::max<std::uint8_t>(state.analogButtonsL2, (data.buttons & 0x100) != 0 ? 255 : 0);
+    data.analog_buttons_r2 = std::max<std::uint8_t>(state.analogButtonsR2, (data.buttons & 0x200) != 0 ? 255 : 0);
 
     const bool live = state.hasMotion && output.motionEnabled;
     const std::array<float, 3> rest{0.0f, 9.80665f, 0.0f};
@@ -169,13 +171,26 @@ PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uin
     data.touch_data_touch_num = touchNum;
     return data;
 }
+
+std::uint32_t InjectedButtons(std::uint64_t now) {
+    static Pad::InputCommandFile commands(std::getenv("APS5_PAD_INPUT_FILE"));
+    static std::uint32_t lastInjected = 0;
+    const auto injected = commands.Buttons(now);
+    if (injected != lastInjected) {
+        lastInjected = injected;
+        timestamp = now;
+    }
+    return injected;
+}
 }
 
 PadData Pad::ReadState() {
     std::lock_guard lock(stateMutex);
     if (failure) std::rethrow_exception(failure);
     if (!initialized) throw std::runtime_error("Pad: read before initialization");
-    return BuildData(state, timestamp, sceKernelGetProcessTime());
+    const std::uint64_t now = sceKernelGetProcessTime();
+    const std::uint32_t injected = InjectedButtons(now);
+    return BuildData(state, timestamp, now, injected);
 }
 
 int Pad::Read(PadData* data, int num) {
@@ -184,14 +199,15 @@ int Pad::Read(PadData* data, int num) {
     if (failure) std::rethrow_exception(failure);
     if (!initialized) throw std::runtime_error("Pad: read before initialization");
     const std::uint64_t now = sceKernelGetProcessTime();
+    const std::uint32_t injected = InjectedButtons(now);
     if (queue.empty()) {
-        data[0] = BuildData(state, timestamp, now);
+        data[0] = BuildData(state, timestamp, now, injected);
         return 1;
     }
     int count = 0;
     while (count < num && !queue.empty()) {
         const QueuedInput& entry = queue.front();
-        data[count++] = BuildData(entry.input, entry.timestamp, now);
+        data[count++] = BuildData(entry.input, entry.timestamp, now, injected);
         queue.pop_front();
     }
     return count;
