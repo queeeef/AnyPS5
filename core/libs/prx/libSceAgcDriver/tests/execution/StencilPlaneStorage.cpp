@@ -21,6 +21,7 @@ using DepthFastClearHarness::Width;
 constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Texels = Width * Height;
 constexpr std::uint32_t Uint8 = 5;
+constexpr std::uint32_t Uint16 = 11;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t SwizzleX111 = 0x24cu;
 constexpr std::uint8_t Reference = 0x5a;
@@ -47,11 +48,11 @@ std::array<std::uint32_t, 4> OutputDescriptor() {
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), static_cast<std::uint32_t>(Output.size() * 4u), 0x31016facu};
 }
 
-std::array<std::uint32_t, 8> StencilDescriptor() {
+std::array<std::uint32_t, 8> StencilDescriptor(std::uint32_t format) {
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Stencil.data()));
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Uint8 << 20u) | (((Width - 1u) & 3u) << 30u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((Width - 1u) & 3u) << 30u),
         ((Width - 1u) >> 2u) | ((Height - 1u) << 14u),
         SwizzleX111 | (Type2D << 28u),
         0u,
@@ -61,11 +62,11 @@ std::array<std::uint32_t, 8> StencilDescriptor() {
     };
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code) {
+void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint32_t format = Uint8) {
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(24, 0u);
     const auto output = OutputDescriptor();
-    const auto texture = StencilDescriptor();
+    const auto texture = StencilDescriptor(format);
     std::copy(output.begin(), output.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
@@ -101,6 +102,13 @@ int main() {
         const auto equal = [](std::uint8_t value) { return VkStencilOpState{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL, 0xffu, 0u, value}; };
         Require(Draw(*device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = equal(Stored)}) == Covered, "a stencil test after image_store into the stencil plane did not see the stored stencil");
         Require(Draw(*device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = equal(Reference)}) == 0u, "the stencil the draw wrote survived an image_store over the whole plane");
+        bool refused = false;
+        try {
+            Run(*device, StoreX, Uint16);
+        } catch (const std::exception& error) {
+            refused = std::string(error.what()).find("stencil plane") != std::string::npos;
+        }
+        Require(refused, "a 16-bit storage image over the stencil plane was not refused");
         std::puts("stencil plane storage tests passed");
         return 0;
     } catch (const std::exception& error) {
