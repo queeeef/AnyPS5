@@ -151,6 +151,59 @@ void importWindowTests(const Context& context) {
     ::operator delete(block, std::align_val_t{window});
 }
 
+void importWindowCrossingTests(const Context& context, const BdaTestAccess& access) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = 2 * piece;
+    void* block = ::operator new(4 * piece, std::align_val_t{window});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    std::memset(guest, 0x33, 4 * piece);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const auto crossing = first + window - 16;
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(window);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto upload = [&] {
+        GuestBufferMemory memory(importing);
+        memory.AddReadable(crossing, 32);
+        memory.Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(crossing, 32, adjustment);
+        const auto* span = HostImportFor(importing, crossing, 32);
+        const auto buffer = span != nullptr && view.buffer == span->buffer && view.offset + adjustment == crossing - span->base ? span->buffer : VkBuffer{VK_NULL_HANDLE};
+        if (buffer == VK_NULL_HANDLE) {
+            const auto bytes = access.bytes(view.buffer);
+            Require(view.offset + adjustment + 32 <= bytes.size() && bytes[view.offset + adjustment] == std::byte{0x33} && bytes[view.offset + adjustment + 31] == std::byte{0x33}, "a copied view crossing the import window misses its bytes");
+        }
+        memory.WriteBack();
+        return buffer;
+    };
+    for (std::size_t index = 0; index < 3; ++index) change(guest + index * piece, true);
+    SetHostImportSpanBudget(piece);
+    Require(upload() == VK_NULL_HANDLE && HostImportFor(importing, crossing, 32) == nullptr, "a span over the span budget was imported");
+    SetHostImportSpanBudget(0);
+    const auto spanned = upload();
+    const auto* span = HostImportFor(importing, crossing, 32);
+    Require(spanned != VK_NULL_HANDLE && span != nullptr && span->base == first + piece && span->bytes == 2 * piece, "a view crossing the import window was not bound in place in one import over the ranges it touches");
+    Require(upload() == spanned, "a second view crossing the import window imported its span again");
+    const auto* grown = HostImportFor(importing, first, 16);
+    Require(grown != nullptr && grown->base == first && grown->bytes == 3 * piece && HostImportFor(importing, crossing, 32) == grown, "the window overlapping the span did not join it");
+    const auto joined = grown->buffer;
+    Require(upload() == joined, "a view crossing the import window left the joined span");
+    change(guest + 2 * piece, false);
+    Require(HostImportFor(importing, crossing, 32) == nullptr, "the span outlived the removal of one of its ranges");
+    const auto* low = HostImportFor(importing, first, 16);
+    Require(low != nullptr && low->base == first && low->bytes == window, "the window was not imported again after its span retired");
+    for (std::size_t index = 0; index < 2; ++index) change(guest + index * piece, false);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{window});
+}
+
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
@@ -1106,6 +1159,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importCrossingTests(context, access);
     importSpanTests(context);
     importWindowTests(context);
+    importWindowCrossingTests(context, access);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();
