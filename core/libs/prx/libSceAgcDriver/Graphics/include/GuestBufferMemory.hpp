@@ -33,7 +33,6 @@ struct HostImport {
     std::uint64_t serial = 0;
     bool unwatched = false;
     bool dmaBuf = false;
-    bool joined = false;
     std::shared_ptr<void> chunk;
 };
 
