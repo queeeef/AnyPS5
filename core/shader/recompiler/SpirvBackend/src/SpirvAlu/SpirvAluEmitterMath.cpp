@@ -1478,8 +1478,6 @@ std::uint32_t EmitFPPackedF16Rules(SpirvEmitterState& state, std::uint32_t arg0,
     const auto op = [&](std::uint32_t opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, u32, lhs, rhs); };
     const auto test = [&](std::uint32_t opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, boolean, lhs, rhs); };
 
-    // In DX10 clamp mode the old native-f16 lowering intentionally bypasses the special-value
-    // rules and lets the final clamp handle the result.
     if (native && clamp && dx10Clamp) return fast;
 
     std::uint32_t nanWords = op(spv::OpBitwiseAnd, arg0, ConstantU32(state, 0x7fff7fffu));
