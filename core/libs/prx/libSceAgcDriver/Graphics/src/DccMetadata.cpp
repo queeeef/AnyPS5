@@ -481,6 +481,14 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
     return keys;
 }
 
+struct PendingFillOutcome {
+    int value = -1;
+    bool mixed = false;
+    bool unknown = false;
+};
+
+std::optional<PendingFillOutcome> PendingFills(const Recorder& recorder, std::uint64_t begin, std::size_t count);
+
 DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized) {
     memoized = false;
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
@@ -488,6 +496,10 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoi
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) {
                 memoized = true;
                 return *keys;
+            }
+            if (const auto outcome = PendingFills(*recorder, metaAddress, count); outcome && !outcome->unknown && (outcome->mixed || outcome->value >= 0)) {
+                memoized = true;
+                return outcome->mixed ? DccKeys::Mixed : ByteKeys(static_cast<std::uint8_t>(outcome->value));
             }
             Recorder::CountSync(2);
             recorder->SyncThrough(metaAddress, count);
@@ -687,8 +699,7 @@ DccKeys EncodedKeys(const GuestTextureResource& resource, DccKeys keys) {
     return keys;
 }
 
-std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count) {
-    const auto begin = resource.dccAddress;
+std::optional<PendingFillOutcome> PendingFills(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
     auto writes = recorder.PendingWritesOver(begin, count);
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
@@ -723,10 +734,16 @@ std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, const GuestText
         if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
         else mixed = true;
     }
-    if (mixed) return DccKeys::Uncompressed;
-    if (value < 0) return std::nullopt;
-    const auto keys = EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value)));
-    if (unknown && keys != DccKeys::Uncompressed) return std::nullopt;
+    return PendingFillOutcome{value, mixed, unknown};
+}
+
+std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count) {
+    const auto outcome = PendingFills(recorder, resource.dccAddress, count);
+    if (!outcome) return std::nullopt;
+    if (outcome->mixed) return DccKeys::Uncompressed;
+    if (outcome->value < 0) return std::nullopt;
+    const auto keys = EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(outcome->value)));
+    if (outcome->unknown && keys != DccKeys::Uncompressed) return std::nullopt;
     return keys;
 }
 
