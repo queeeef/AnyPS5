@@ -103,6 +103,7 @@ VkConservativeRasterizationModeEXT decodeConservativeRasterization(const QueueSt
 // DecodeState would): the masks whose set bits are unsupported, and the depth-control verdict.
 constexpr std::uint32_t LayerExports = (1u << 18u) | (1u << 19u) | (1u << 21u) | (1u << 24u);
 constexpr std::uint32_t ClipCullExports = 0xffffu | (1u << 22u) | (1u << 23u);
+constexpr std::uint32_t LayerFilterBits = 0xfu << LayerFilterShift;
 constexpr std::uint32_t DepthControlMask = ~0x007007f0u;
 // EXEC_ON_HIER_FAIL / EXEC_ON_NOOP / EXEC_IF_OVERLAPPED (bits 9, 10, 17) only force the pixel shader
 // to run, which it always does here.
@@ -694,7 +695,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     }
     APS5_LOG_OUT_DEBUG("Topology=%u", static_cast<unsigned>(result.topology));
     result.primitiveRestart = read(queue.userConfig, 0x24b, RegisterBank::UserConfig) != 0 && !result.rectList && result.topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-    zero(cx, 0x207, ~(LayerExports | ClipCullExports), "layer, viewport or auxiliary vertex exports");
+    zero(cx, 0x207, ~(LayerExports | ClipCullExports | LayerFilterBits), "layer, viewport or auxiliary vertex exports");
     Require(std::popcount(read(cx, 0x207) & 0xffffu) <= 8, "more than eight clip and cull distances are unsupported");
     result.paClVsOutCntl = read(cx, 0x207);
     result.samples = decodeSamples(cx);
@@ -827,7 +828,11 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         APS5_LOG_OUT_DEBUG("Render extent from screen=%ux%u", result.renderExtent.width, result.renderExtent.height);
         Require(result.renderExtent.width != 0 && result.renderExtent.height != 0, "empty framebuffer extent for a draw without color writes");
     }
-    if ((read(cx, 0x207) & LayerExports & ~result.layerExports & ~(1u << 21u)) != 0) {
+    if ((read(cx, 0x207) & LayerFilterBits) != 0) {
+        Require(!result.hasColorTarget && result.depth, "a layer filter outside a layered depth-only draw");
+        result.layerExports = read(cx, 0x207) & ((1u << 18u) | LayerFilterBits);
+    }
+    if ((read(cx, 0x207) & LayerExports & ~result.layerExports & ~(1u << 21u) & ~(1u << 24u)) != 0) {
         static std::mutex reportedMutex;
         static std::set<std::array<std::uint64_t, 6>> reported;
         const auto colorView = find(cx, 0x31b);
@@ -1023,6 +1028,21 @@ GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
     surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
     surface.dccPipeAligned = color.dccPipeAligned;
     return surface;
+}
+
+std::uint32_t LayeredDepthSlices(const Registers& cx) {
+    const auto control = find(cx, 0x207);
+    const auto view = find(cx, 0x002);
+    const auto zInfo = find(cx, 0x010);
+    if (control == cx.end() || view == cx.end() || zInfo == cx.end()) return 0;
+    if ((control->second & (1u << 18u)) == 0 || (control->second & LayerFilterBits) != 0 || (zInfo->second & 3u) == 0) return 0;
+    const auto first = view->second & 0x7ffu;
+    const auto last = (view->second >> 13u) & 0x7ffu;
+    if (last <= first) return 0;
+    const auto colorControl = find(cx, 0x202);
+    const auto shaderMask = find(cx, 0x8f);
+    if (colorControl != cx.end() && ((colorControl->second >> 4u) & 7u) != 0 && shaderMask != cx.end() && (shaderMask->second & ColorWriteMask(cx)) != 0) return 0;
+    return std::min(last - first + 1u, 15u);
 }
 
 ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
@@ -1239,7 +1259,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         if (value(queue.userConfig, 0x242, primitive) && (primitive & 0x3fu) != 1 && (primitive & 0x3fu) != 2 && (primitive & 0x3fu) != 3 && (primitive & 0x3fu) != 4 && (primitive & 0x3fu) != 5 && (primitive & 0x3fu) != 6) return "AGC graphics: primitive restart is only supported for point, line and triangle topologies";
         if (value(cx, 0x103, resetIndex) && (resetIndex & 0xffffu) != 0xffffu) return "AGC graphics: primitive restart index other than all ones is unsupported";
     }
-    if (auto reason = nonzero(cx, 0x207, ~(LayerExports | ClipCullExports), "layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
+    if (auto reason = nonzero(cx, 0x207, ~(LayerExports | ClipCullExports | LayerFilterBits), "layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
     if (value(cx, 0x207, word) && std::popcount(word & 0xffffu) > 8) return require(false, "more than eight clip and cull distances are unsupported");
     if (value(cx, 0x200, word)) {
         const auto renderControl = find(cx, 0x000);

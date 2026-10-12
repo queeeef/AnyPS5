@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
 #include <functional>
@@ -275,7 +276,29 @@ void Driver::execute(const Submission& submission) {
 
                 try {
                     std::string rejected;
-                    const auto verdict = draw(queue, packet, submission, rejected);
+                    auto verdict = DrawVerdict::Nothing;
+                    if (const auto slices = Graphics::LayeredDepthSlices(queue.context); slices > 1) {
+                        const auto view = queue.context[0x002];
+                        const auto control = queue.context[0x207];
+                        struct Restore {
+                            QueueState& queue;
+                            std::uint32_t view;
+                            std::uint32_t control;
+                            ~Restore() {
+                                queue.context[0x002] = view;
+                                queue.context[0x207] = control;
+                            }
+                        } restore{queue, view, control};
+                        const auto first = view & 0x7ffu;
+                        for (std::uint32_t slice = 0; slice < slices && verdict != DrawVerdict::Rejected; ++slice) {
+                            queue.context[0x002] = (view & ~0x00ffffffu) | (first + slice) | ((first + slice) << 13u);
+                            queue.context[0x207] = control | ((slice + 1u) << Graphics::LayerFilterShift);
+                            const auto sliceVerdict = draw(queue, packet, submission, rejected);
+                            if (sliceVerdict != DrawVerdict::Nothing) verdict = sliceVerdict;
+                        }
+                    } else {
+                        verdict = draw(queue, packet, submission, rejected);
+                    }
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {

@@ -169,6 +169,7 @@ struct SpirvEmitterState {
     std::uint32_t pointSizeVariable = 0;
     std::uint32_t clipDistanceVariable = 0;
     std::optional<std::uint32_t> zeroPositionClipIndex;
+    std::optional<std::uint32_t> layerFilterClipIndex;
     std::uint32_t cullDistanceVariable = 0;
     std::uint32_t layerVariable = 0;
     std::uint32_t viewportIndexVariable = 0;

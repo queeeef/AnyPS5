@@ -137,6 +137,8 @@ std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& 
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
+inline constexpr std::uint32_t LayerFilterShift = 28;
+std::uint32_t LayeredDepthSlices(const Registers& context);
 GuestTextureResource SurfaceForTarget(const ColorTarget& color);
 
 struct ColorMetadataPass {

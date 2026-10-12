@@ -12,6 +12,7 @@ struct Module {
     std::vector<std::uint32_t> capabilities;
     std::vector<std::string_view> extensions;
     bool layerOutput = false;
+    bool clipOutput = false;
     std::uint32_t version = 0;
 };
 
@@ -26,6 +27,7 @@ Module inspect(const std::vector<std::uint32_t>& words) {
         if (opcode == 17u && length == 2) module.capabilities.push_back(words[at + 1]);
         if (opcode == 10u && length >= 2) module.extensions.emplace_back(reinterpret_cast<const char*>(&words[at + 1]));
         if (opcode == 71u && length == 4 && words[at + 2] == 11u && words[at + 3] == 9u) module.layerOutput = true;
+        if (opcode == 71u && length == 4 && words[at + 2] == 11u && words[at + 3] == 3u) module.clipOutput = true;
         at += length;
     }
     return module;
@@ -79,6 +81,11 @@ int main() {
         const auto core = recompile(layer, false);
         if (!core.layerOutput || !has(core.capabilities, 69u) || has(core.capabilities, 5254u) || core.version != 0x00010500u) {
             std::fprintf(stderr, "a vertex layer export without the extension: layer %d, version 0x%x\n", core.layerOutput ? 1 : 0, core.version);
+            return 1;
+        }
+        const auto filtered = recompile(layer | (3u << 28u), true);
+        if (filtered.layerOutput || has(filtered.capabilities, 5254u) || !filtered.clipOutput) {
+            std::fprintf(stderr, "a layer export filtered to one slice: layer %d, clip distance %d\n", filtered.layerOutput ? 1 : 0, filtered.clipOutput ? 1 : 0);
             return 1;
         }
         const auto ignored = recompile(0u, true);

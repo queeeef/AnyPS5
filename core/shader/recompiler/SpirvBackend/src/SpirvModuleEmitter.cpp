@@ -384,8 +384,18 @@ void EmitAuxPositionExport(SpirvValueEmitContext& ctx, std::uint32_t data, const
             if (output.layer) {
                 const auto layer = state.module.AllocateId();
                 state.module.AddFunction(spv::OpBitwiseAnd, TypeU32(state), layer, raw, ConstantU32(state, 0x7ffu));
-                const auto pointer = state.program.Resources().stage == IrShaderStage::Mesh ? MeshOutputPointer(state, StageOutputKind::Layer) : state.layerVariable;
-                state.module.AddFunction(spv::OpStore, pointer, layer);
+                if (state.layerFilterClipIndex) {
+                    const auto kept = state.module.AllocateId();
+                    const auto distance = state.module.AllocateId();
+                    const auto pointer = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpIEqual, TypeBool(state), kept, layer, ConstantU32(state, (state.inputInfo.vertex->paClVsOutCntl >> 28u) - 1u));
+                    state.module.AddFunction(spv::OpSelect, TypeF32(state), distance, kept, ConstantF32Value(state, 1.0f), ConstantF32Value(state, -1.0f));
+                    state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeF32(state)), pointer, state.clipDistanceVariable, ConstantU32(state, *state.layerFilterClipIndex));
+                    state.module.AddFunction(spv::OpStore, pointer, distance);
+                } else {
+                    const auto pointer = state.program.Resources().stage == IrShaderStage::Mesh ? MeshOutputPointer(state, StageOutputKind::Layer) : state.layerVariable;
+                    state.module.AddFunction(spv::OpStore, pointer, layer);
+                }
             }
             if (output.viewport) {
                 const auto viewport = state.module.AllocateId();

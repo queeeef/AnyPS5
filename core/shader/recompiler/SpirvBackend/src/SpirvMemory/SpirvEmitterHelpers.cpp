@@ -305,7 +305,9 @@ void DefineOutputs(SpirvEmitterState& state) {
             cullDistanceCount = std::max(cullDistanceCount, output.index + 1u);
         }
     }
+    const bool layerFilter = state.inputInfo.vertex != nullptr && (state.inputInfo.vertex->paClVsOutCntl >> 28u) != 0u;
     if (state.program.Resources().stage == IrShaderStage::Mesh) {
+        if (layerFilter) FailEmit("a layered depth draw replayed per slice through a mesh program is unsupported");
         DefineMeshOutputs(state);
         return;
     }
@@ -319,6 +321,11 @@ void DefineOutputs(SpirvEmitterState& state) {
         clipDistanceCount += 1u;
         if (clipDistanceCount > MaxClipDistances) {
             FailEmit("guest clip distances plus the all-zero clip position distance exceed " + std::to_string(MaxClipDistances) + " clip distances");
+        }
+        if (layerFilter) {
+            state.layerFilterClipIndex = clipDistanceCount;
+            clipDistanceCount += 1u;
+            if (clipDistanceCount > MaxClipDistances) FailEmit("guest clip distances plus the layer filter distance exceed " + std::to_string(MaxClipDistances) + " clip distances");
         }
     }
     const auto BuiltIn = [&](std::uint32_t& variable, std::uint32_t type, const char* name, std::uint32_t builtin) {

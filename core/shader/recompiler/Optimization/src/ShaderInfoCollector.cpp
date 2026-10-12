@@ -436,7 +436,7 @@ void CollectOutputs(const IrProgram& program, ShaderStageInputInfo inputInfo, Sh
                         if (output.pointSize) {
                             AddOutput(info, StageOutputKind::PointSize, 0, 0, "gl_PointSize");
                         }
-                        if (output.layer) {
+                        if (output.layer && (inputInfo.vertex->paClVsOutCntl >> 28u) == 0u) {
                             AddOutput(info, StageOutputKind::Layer, 0, 0, "gl_Layer");
                         }
                         if (output.clipDistance != std::numeric_limits<std::uint32_t>::max()) {
