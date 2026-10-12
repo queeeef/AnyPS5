@@ -724,8 +724,10 @@ std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, const GuestText
         else mixed = true;
     }
     if (mixed) return DccKeys::Uncompressed;
-    if (unknown || value < 0) return std::nullopt;
-    return EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value)));
+    if (value < 0) return std::nullopt;
+    const auto keys = EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value)));
+    if (unknown && keys != DccKeys::Uncompressed) return std::nullopt;
+    return keys;
 }
 
 }
