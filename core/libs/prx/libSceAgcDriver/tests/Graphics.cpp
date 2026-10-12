@@ -1300,6 +1300,8 @@ void DepthStencilTests() {
     queue = makeState();
     queue.context[0x31b] = 1u << 26u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "mip exceeds");
+    queue.context[0x31b] = 1u << 13u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "beyond the array surface");
     queue.context[0x31b] = 1u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "ends before its first slice");
     const auto sliced = reinterpret_cast<std::uintptr_t>(sliceMemory.data());
