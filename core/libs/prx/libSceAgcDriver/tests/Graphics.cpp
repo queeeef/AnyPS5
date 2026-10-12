@@ -1151,7 +1151,7 @@ void htileDepthClearTests() {
 void memoryValueFillTests() {
     static constexpr std::array<std::uint32_t, 9> kernel{0xd7460000u, 0x04010c08u, 0xf4201a82u, 0xfa000000u, 0xbf8cc07fu, 0x7e02026au, 0xe0102000u, 0x80000100u, 0xbf810000u};
     const std::array<std::uint32_t, 3> wave{64, 1, 1};
-    const std::array<std::uint32_t, 8> userData{0x50b00000u, 0x00040020u, 0x20000u, 0x00027facu, 0x34be64e0u, 0x20u, 0u, 0u};
+    const std::array<std::uint32_t, 8> userData{0x50b00000u, 0x00040020u, 0x20000u, 0x00014204u, 0x34be64e0u, 0x00100020u, 1u, 0x0004dfacu};
     const auto match = [&](std::span<const std::uint32_t> code, std::array<std::uint32_t, 8> words, std::array<std::uint32_t, 3> threads, std::array<std::uint32_t, 3> groups) {
         return AgcDriver::Graphics::MatchMemoryValueFill(code, words, threads, groups);
     };
@@ -1175,6 +1175,25 @@ void memoryValueFillTests() {
     nowhere[4] = 0;
     nowhere[5] = 0;
     Require(!match(kernel, nowhere, wave, {2048, 1, 1}), "a fill from a null value pointer was recognized");
+    auto empty = userData;
+    empty[6] = 0;
+    Require(!match(kernel, empty, wave, {2048, 1, 1}), "a fill whose value buffer has no records was taken for a fill from memory");
+    auto raw = userData;
+    raw[5] = 0x20u;
+    raw[6] = 4u;
+    Require(match(kernel, raw, wave, {2048, 1, 1}).has_value(), "a fill from a 4-byte raw value buffer was not recognized");
+    raw[6] = 3u;
+    Require(!match(kernel, raw, wave, {2048, 1, 1}), "a fill from a value buffer shorter than a dword was taken for a fill from memory");
+    for (const std::uint32_t format : {20u, 21u, 22u}) {
+        auto typed = userData;
+        typed[3] = (typed[3] & ~(0x7fu << 12u)) | (format << 12u);
+        Require(match(kernel, typed, wave, {2048, 1, 1}).has_value(), "a fill through a 32-bit buffer format was not recognized");
+    }
+    for (const std::uint32_t format : {0x27u, 0x0du, 0x4bu}) {
+        auto converted = userData;
+        converted[3] = (converted[3] & ~(0x7fu << 12u)) | (format << 12u);
+        Require(!match(kernel, converted, wave, {2048, 1, 1}), "a fill through a converting buffer format was taken for a raw dword fill");
+    }
     auto other = kernel;
     other[6] ^= 1u;
     Require(!match(other, userData, wave, {2048, 1, 1}), "a different kernel was taken for the memory value fill");
