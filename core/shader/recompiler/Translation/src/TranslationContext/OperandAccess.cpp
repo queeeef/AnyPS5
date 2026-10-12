@@ -342,17 +342,32 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
 }
 
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct) {
-    const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
-    IrValue* bits = &ir.BitCastU32(*result);
-    bits = &ir.Select(isNan(*bits), ir.Constant(0xffc00000u), *bits);
+    const auto isNan = [&](IrValue& value) -> IrValue& { return ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&value}); };
+    IrValue* candidate = nullptr;
     for (auto source = sources.end(); source != sources.begin();) {
         --source;
         IrValue& sourceBits = ir.BitCastU32(**source);
-        IrValue* selected = &isNan(sourceBits);
-        if (invalidProduct != nullptr && source + 1 == sources.end() && sources.size() == 3u) selected = &ir.LogicalAnd(*selected, ir.LogicalNot(*invalidProduct));
-        bits = &ir.Select(*selected, quietNan32(IrU32(sourceBits)).Value(), *bits);
+        if (candidate == nullptr) {
+            candidate = invalidProduct != nullptr && sources.size() == 3u ? &ir.Select(*invalidProduct, ir.Constant(0u), sourceBits) : &sourceBits;
+            continue;
+        }
+        candidate = &ir.Select(isNan(**source), sourceBits, *candidate);
     }
-    return &ir.BitCastF32(*bits);
+    IrValue& fallback = ir.Select(isNan(*result), ir.Constant(0xffc00000u), ir.BitCastU32(*result));
+    return &ir.BitCastF32(ir.Select(isNan(ir.BitCastF32(*candidate)), quietNan32(IrU32(*candidate)).Value(), fallback));
+}
+
+IrValue* TranslationContext::rareFixupF32(IrValue* plain, IrValue* fixed, bool tinyFlushed) {
+    if (fixed == plain) return fixed;
+    const std::uint32_t roundMode = floatMode.has_value() ? floatMode->floatMode & 3u : 0u;
+    if (tinyFlushed && roundMode != 0u) return fixed;
+    IrValue* special = nullptr;
+    if (tinyFlushed) {
+        special = &ir.ULessThan(ir.BitwiseAnd(ir.IAdd(ir.BitCastU32(*plain), ir.Constant(0x007fffffu)), ir.Constant(0x7fffffffu)), ir.Constant(0x01000000u));
+    } else {
+        special = &ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {plain});
+    }
+    return &ir.Emit(IrOpcode::SelectF32, IrType::F32, {special, fixed, plain}, SelectFlags{true});
 }
 
 IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
