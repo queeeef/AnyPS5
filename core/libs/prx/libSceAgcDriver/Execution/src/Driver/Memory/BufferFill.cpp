@@ -59,7 +59,7 @@ std::optional<DwordPatternFill> MatchDwordPatternFill(std::span<const std::uint3
 }
 
 std::optional<DwordPatternFill> MatchZeroDwordFill(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
-    static const bool enabled = std::getenv("APS5_NO_FILL_HLE") == nullptr;
+    static const bool enabled = std::getenv("APS5_NO_FILL_HLE") == nullptr && std::getenv("APS5_LOCAL_NO_ZERO_FILL") == nullptr;
     if (!enabled || userData.size() != 4 || packet.size() < 5 || !compute.groupIdEnable[0] || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1) return std::nullopt;
     static constexpr std::array<std::uint32_t, 6> kernel{0xd7460000u, 0x04010c04u, 0x7e020280u, 0xe0102000u, 0x80000100u, 0xbf810000u};
     if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
