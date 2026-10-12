@@ -484,7 +484,18 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
                     text += item;
                     *top = 0;
                 }
-                std::fprintf(stderr, "[local-dcc] keys of 0x%llx: %zu key bytes, %ux%u tile %u, values%s\n", static_cast<unsigned long long>(resource.baseAddress), keyBytes, resource.width, resource.height, static_cast<unsigned>(resource.tileMode), text.c_str());
+                std::string runs;
+                std::size_t runCount = 0;
+                for (std::size_t i = 0; i < keyBytes && runCount < 40;) {
+                    std::size_t j = i + 1;
+                    while (j < keyBytes && bytes[j] == bytes[i]) ++j;
+                    char item[32];
+                    std::snprintf(item, sizeof(item), " %02x*%zu", static_cast<unsigned>(bytes[i]), j - i);
+                    runs += item;
+                    ++runCount;
+                    i = j;
+                }
+                std::fprintf(stderr, "[local-dcc] keys of 0x%llx: %zu key bytes, %ux%u tile %u mips %u pipe-aligned %d, values%s; runs%s\n", static_cast<unsigned long long>(resource.baseAddress), keyBytes, resource.width, resource.height, static_cast<unsigned>(resource.tileMode), resource.mipCount, resource.dccPipeAligned ? 1 : 0, text.c_str(), runs.c_str());
             }
         }
         return DccKeys::Uncompressed;
