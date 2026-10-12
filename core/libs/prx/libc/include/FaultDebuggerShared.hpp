@@ -20,6 +20,7 @@ struct Header {
     std::uint64_t head;
     std::uint64_t tail;
     std::uint64_t handled;
+    std::uint64_t retried;
     std::uint32_t overflow;
     std::uint32_t attached;
     std::uint32_t ring[RingSize];

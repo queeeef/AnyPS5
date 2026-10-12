@@ -387,7 +387,8 @@ private:
         for (; tail < head; ++tail) consumeFault(faultBase + static_cast<std::uintptr_t>(faultHeader->ring[tail % FaultDebugger::RingSize]) * pageBytes);
         std::atomic_ref<std::uint64_t>(faultHeader->tail).store(tail, std::memory_order_release);
         if (const auto now = std::chrono::steady_clock::now(); now - lastDebuggerReport >= std::chrono::seconds(10)) {
-            std::fprintf(stderr, "[fault-debugger] %llu shared-page write faults resumed by the debugger in the last 10 s\n", static_cast<unsigned long long>(faultHeader->handled - reportedDebugger));
+            std::fprintf(stderr, "[fault-debugger] %llu shared-page write faults resumed by the debugger in the last 10 s, %llu retried on a page already writable\n", static_cast<unsigned long long>(faultHeader->handled - reportedDebugger), static_cast<unsigned long long>(faultHeader->retried - reportedRetried));
+            reportedRetried = faultHeader->retried;
             reportedDebugger = faultHeader->handled;
             lastDebuggerReport = now;
         }
@@ -600,6 +601,7 @@ private:
     std::uintptr_t faultBase = 0;
     std::uint64_t faultPages = 0;
     std::uint64_t reportedDebugger = 0;
+    std::uint64_t reportedRetried = 0;
     bool reportedFirstConsumed = false;
     bool reportedVectoredWhileAttached = false;
     std::chrono::steady_clock::time_point lastDebuggerReport = std::chrono::steady_clock::now();

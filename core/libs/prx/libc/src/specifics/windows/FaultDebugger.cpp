@@ -49,7 +49,15 @@ int main(int argc, char** argv) {
             if (address < begin || address >= end || process == nullptr) break;
             const auto index = (address - begin) / header->pageBytes;
             const auto state = table[index];
-            if (state != FaultDebugger::ArmedReadWrite && state != FaultDebugger::ArmedExecuteReadWrite) break;
+            if (state != FaultDebugger::ArmedReadWrite && state != FaultDebugger::ArmedExecuteReadWrite) {
+                MEMORY_BASIC_INFORMATION memory{};
+                const auto writable = PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+                if (VirtualQueryEx(process, reinterpret_cast<void*>(address), &memory, sizeof(memory)) != 0 && memory.State == MEM_COMMIT && (memory.Protect & writable) != 0 && (memory.Protect & PAGE_GUARD) == 0) {
+                    ++header->retried;
+                    status = DBG_CONTINUE;
+                }
+                break;
+            }
             DWORD previous;
             const auto page = reinterpret_cast<void*>(begin + index * header->pageBytes);
             if (!VirtualProtectEx(process, page, header->pageBytes, state == FaultDebugger::ArmedReadWrite ? PAGE_READWRITE : PAGE_EXECUTE_READWRITE, &previous)) break;
