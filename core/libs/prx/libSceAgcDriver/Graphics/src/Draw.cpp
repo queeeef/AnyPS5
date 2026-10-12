@@ -1171,6 +1171,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
+    // TODO(technical debt): local diagnostic, what a resident-target lookup of 1 ms or more spent its time on.
+    const auto outcomesBefore = profile ? ThreadLookupOutcomes() : LookupOutcomes{};
+    const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
@@ -1188,6 +1191,14 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         if (lookupUs >= 1000.0) {
             ++outcome.slowLookups;
             outcome.slowLookupUs += lookupUs;
+            const auto& outcomesAfter = ThreadLookupOutcomes();
+            char text[768];
+            int n = std::snprintf(text, sizeof(text), "[slow-target] 0x%llx %ux%u fmt %u: %.0f us, GPU waits %.0f us, pages walked %llu;", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned>(color.format), lookupUs, (Recorder::ThreadWaitedMs() - waitedBefore) * 1000.0, static_cast<unsigned long long>((GuestMemory::ThreadCollectedBytes() - walkedBefore) / 4096));
+            for (std::size_t kind = 0; kind < LookupOutcomes::Count && n > 0 && n < static_cast<int>(sizeof(text)); ++kind) {
+                const auto count = outcomesAfter.counts[kind] - outcomesBefore.counts[kind];
+                if (count != 0) n += std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n), " %s %llux %.0f us", LookupOutcomes::Name(static_cast<LookupOutcomes::Kind>(kind)), static_cast<unsigned long long>(count), (outcomesAfter.ms[kind] - outcomesBefore.ms[kind]) * 1000.0);
+            }
+            std::fprintf(stderr, "%s\n", text);
         }
         outcome.lookupUs += lookupUs;
         outcome.pagesWalked += (GuestMemory::ThreadCollectedBytes() - walkedBefore) / 4096;
