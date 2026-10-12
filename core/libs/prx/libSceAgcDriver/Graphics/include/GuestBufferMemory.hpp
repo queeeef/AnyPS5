@@ -33,8 +33,6 @@ struct HostImport {
     std::uint64_t serial = 0;
     bool unwatched = false;
     bool dmaBuf = false;
-    // TODO(technical debt): local WIP, made over ranges no windowed run joins (spanningImport).
-    bool spanning = false;
     std::shared_ptr<void> chunk;
 };
 
