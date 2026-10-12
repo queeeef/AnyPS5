@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
+#include <array>
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -758,8 +760,44 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
         if (const auto info = recorder->DescribePendingWrite(metaAddress, count)) text += " | newest batch range [" + std::to_string(info->rangeBegin) + "," + std::to_string(info->rangeEnd) + ") open " + std::to_string(info->open);
         std::fprintf(stderr, "%s\n", text.c_str());
     }
+    // TODO(technical debt): local diagnostic, why key reads wait for the GPU (counts and wait time per 10 s).
+    static const bool localKeyWaitProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    bool unknown = false;
+    bool shadowed = false;
+    if (localKeyWaitProfile) {
+        const auto writes = recorder->PendingWritesOver(metaAddress, count);
+        unknown = std::any_of(writes.begin(), writes.end(), [](const Recorder::PendingWrite& write) { return write.value < 0; });
+        shadowed = AnyShadowedOverlaps(metaAddress, count);
+    }
+    const auto waitStart = std::chrono::steady_clock::now();
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
+    if (localKeyWaitProfile) {
+        const auto kind = unknown ? 0 : shadowed ? 1 : 2;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+        static std::mutex mutex;
+        static std::array<std::uint64_t, 3> counts{};
+        static std::array<double, 3> waited{};
+        static std::map<std::string, std::pair<std::uint64_t, double>> surfaces;
+        static auto last = std::chrono::steady_clock::now();
+        std::lock_guard lock(mutex);
+        ++counts[kind];
+        waited[kind] += ms;
+        auto& surface = surfaces[std::to_string(resource.width) + "x" + std::to_string(resource.height) + " fmt " + std::to_string(resource.format) + (unknown ? " shader" : shadowed ? " fill-shadowed" : " fill")];
+        ++surface.first;
+        surface.second += ms;
+        if (std::chrono::steady_clock::now() - last >= std::chrono::seconds(10)) {
+            last = std::chrono::steady_clock::now();
+            std::vector<std::pair<std::string, std::pair<std::uint64_t, double>>> top(surfaces.begin(), surfaces.end());
+            std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+            std::string text;
+            for (std::size_t i = 0; i < top.size() && i < 6; ++i) text += " [" + top[i].first + ": " + std::to_string(top[i].second.first) + "x " + std::to_string(static_cast<long long>(top[i].second.second)) + " ms]";
+            std::fprintf(stderr, "[local-keywait] 10 s: written by a shader %llu (%.0f ms), known fills under a unit shadow %llu (%.0f ms), other fills %llu (%.0f ms); top:%s\n", static_cast<unsigned long long>(counts[0]), waited[0], static_cast<unsigned long long>(counts[1]), waited[1], static_cast<unsigned long long>(counts[2]), waited[2], text.c_str());
+            counts = {};
+            waited = {};
+            surfaces.clear();
+        }
+    }
     return std::nullopt;
 }
 
