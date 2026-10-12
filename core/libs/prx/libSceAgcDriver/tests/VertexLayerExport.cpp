@@ -48,8 +48,8 @@ bool named(const std::vector<std::string_view>& values, std::string_view value) 
 Module recompile(std::uint32_t control, bool layerExtension) {
     using namespace ShaderRecompiler;
     static const std::array<std::uint32_t, 5> code{0xf80000cfu, 0x00000000u, 0xf80008dfu, 0x01010101u, 0xbf810000u};
-    static const std::array<std::uint32_t, 2> withExtension{1u, 5254u};
-    static const std::array<std::uint32_t, 1> without{1u};
+    static const std::array<std::uint32_t, 3> withExtension{1u, 32u, 5254u};
+    static const std::array<std::uint32_t, 2> without{1u, 32u};
     ShaderVertexStageInfo vertex{};
     vertex.paClVsOutCntl = control;
     RecompileRequest request{};

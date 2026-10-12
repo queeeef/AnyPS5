@@ -16,6 +16,8 @@
 #include <span>
 #include <array>
 #include <sstream>
+#include <mutex>
+#include <set>
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -826,10 +828,14 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         Require(result.renderExtent.width != 0 && result.renderExtent.height != 0, "empty framebuffer extent for a draw without color writes");
     }
     if ((read(cx, 0x207) & LayerExports & ~result.layerExports & ~(1u << 21u)) != 0) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
+        static std::mutex reportedMutex;
+        static std::set<std::array<std::uint64_t, 6>> reported;
+        const auto colorView = find(cx, 0x31b);
+        const auto depthView = find(cx, 0x002);
+        const std::array<std::uint64_t, 6> key{read(cx, 0x207), result.hasColorTarget ? (static_cast<std::uint64_t>(result.color.extent.width) << 32u) | result.color.extent.height : 0u, result.hasColorTarget ? (static_cast<std::uint64_t>(result.color.depth) << 32u) | result.color.arrayLastSlice : 0u, colorView == cx.end() ? ~0ull : colorView->second, depthView == cx.end() ? ~0ull : depthView->second, result.depth ? (static_cast<std::uint64_t>(result.depth->extent.width) << 32u) | result.depth->extent.height : 0u};
+        std::lock_guard lock(reportedMutex);
+        if (reported.size() < 32 && reported.insert(key).second) {
+            std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x): colors=%zu color0=%ux%u depth=%u arrayLast=%u arraySlice=%u mips=%u fmt=%d CB_COLOR0_VIEW=0x%llx | depthTarget=%s %ux%u DB_DEPTH_VIEW=0x%llx | extent=%ux%u\n", read(cx, 0x207), result.colors.size(), result.hasColorTarget ? result.color.extent.width : 0u, result.hasColorTarget ? result.color.extent.height : 0u, result.hasColorTarget ? result.color.depth : 0u, result.hasColorTarget ? result.color.arrayLastSlice : 0u, result.hasColorTarget ? result.color.arraySlice : 0u, result.hasColorTarget ? result.color.mipCount : 0u, result.hasColorTarget ? static_cast<int>(result.color.format) : 0, static_cast<unsigned long long>(key[3]), result.depth ? "yes" : "no", result.depth ? result.depth->extent.width : 0u, result.depth ? result.depth->extent.height : 0u, static_cast<unsigned long long>(key[4]), result.renderExtent.width, result.renderExtent.height);
         }
     }
     const auto xs = readFloat(cx, 0x10f);
@@ -1137,10 +1143,13 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
             color.dccAlphaOnMsb = DccAlphaOnMsb(color.format, swap);
             color.dccPipeAligned = ((attrib3 >> 30u) & 1u) != 0;
         } else {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
-                std::fprintf(stderr, "[gpu] DCC keys of mipmapped color targets are ignored\n");
+            static std::mutex reportedMutex;
+            static std::set<std::uint64_t> reported;
+            std::lock_guard lock(reportedMutex);
+            if (reported.size() < 32 && reported.insert(color.surfaceAddress ^ (static_cast<std::uint64_t>(viewMip) << 60u)).second) {
+                const auto dccHigh = find(cx, 0x3a8 + slot);
+                const auto keys = ((dccHigh == cx.end() ? 0ull : static_cast<std::uint64_t>(dccHigh->second & 0xffu)) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x325 + stride)) << 8u);
+                std::fprintf(stderr, "[gpu] DCC keys of mipmapped color targets are ignored: surface 0x%llx %ux%u mips=%u view mip %u (%ux%u) vk format %d, keys at 0x%llx\n", static_cast<unsigned long long>(color.surfaceAddress), color.surfaceExtent.width, color.surfaceExtent.height, maxMip + 1u, viewMip, color.extent.width, color.extent.height, static_cast<int>(decoded.format), static_cast<unsigned long long>(keys));
             }
         }
     }
