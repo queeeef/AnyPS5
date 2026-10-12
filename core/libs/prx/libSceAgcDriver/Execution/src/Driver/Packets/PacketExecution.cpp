@@ -215,6 +215,7 @@ void Driver::execute(const Submission& submission) {
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
             }
             ++flipsCounted;
+            GuestMemory::BumpFrameSerial();
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
 

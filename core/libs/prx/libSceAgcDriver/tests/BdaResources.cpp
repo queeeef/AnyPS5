@@ -175,6 +175,34 @@ void failedImportRemapTests(const Context& context, const BdaTestAccess& access)
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void unwatchedImportWindowTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(4 * piece, std::align_val_t{2 * piece});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(8ull << 20u);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, true);
+    SetImportWatch(importing, ImportWatch::Unwatch);
+    Require(HostImportsUnwatch(importing), "the device's imports were not declared unwatching");
+    const auto* one = HostImportFor(importing, first + piece + 16, 32);
+    Require(one != nullptr && one->base == first + piece && one->bytes == piece, "an unwatching device imported more than the allocation it serves");
+    Require(HostImportFor(importing, first + piece - 16, 32) == nullptr, "a view across two allocations was imported on an unwatching device");
+    const auto* kept = HostImportFor(importing, first + piece + 100, 16);
+    Require(kept == one, "the allocation's import was not reused");
+    SetImportWatch(importing, ImportWatch::Watch);
+    for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, false);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{2 * piece});
+}
+
 void importWindowTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     constexpr std::size_t window = 2 * piece;
@@ -1163,6 +1191,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importSpanTests(context);
     failedImportRemapTests(context, access);
     importWindowTests(context);
+    unwatchedImportWindowTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();

@@ -693,6 +693,16 @@ std::uint64_t ForgetSerial() {
     return forgetSerial.load(std::memory_order_acquire);
 }
 
+std::atomic<std::uint64_t> frameSerialCounter{1};
+
+void BumpFrameSerial() {
+    frameSerialCounter.fetch_add(1, std::memory_order_release);
+}
+
+std::uint64_t FrameSerial() {
+    return frameSerialCounter.load(std::memory_order_acquire);
+}
+
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
     require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "address range overflow");
     const TimedAccess timed(CounterVerify, bytes);

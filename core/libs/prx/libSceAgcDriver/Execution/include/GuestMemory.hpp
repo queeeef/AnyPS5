@@ -190,6 +190,9 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 // value before consulting the page states and reading directly, and the same value after, knows
 // the states it consulted were current and no page it read changed its mapping meanwhile.
 std::uint64_t ForgetSerial();
+// Counts presented frames (flips); untracked storage surfaces compare their guest bytes once per frame.
+void BumpFrameSerial();
+std::uint64_t FrameSerial();
 
 // Attribution of guest memory accesses (the [hooksync] line in Recorder.cpp and the read-site
 // counts of the [guestmem] line, APS5_PROFILE_DRAW): a sync the flush hook makes for an access has
