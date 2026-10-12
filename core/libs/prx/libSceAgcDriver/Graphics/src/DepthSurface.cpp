@@ -538,6 +538,11 @@ void SeedStorageFromStencil(const Context& context, const std::shared_ptr<Storag
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && surface->target.stencilAddress != 0 && surface->target.stencilAddress == address && surface->target.address != address; });
     if (found == list.rend()) return;
     auto& surface = **found;
+    const auto& descriptor = storage->Descriptor();
+    const auto storageFormat = storage->StorageFormat();
+    const bool r8 = storageFormat == VK_FORMAT_R8_UINT || storageFormat == VK_FORMAT_R8_UNORM || storageFormat == VK_FORMAT_R8_SINT || storageFormat == VK_FORMAT_R8_SNORM;
+    const bool oneSlice = descriptor.dimension == TextureDimension::k2D || (descriptor.dimension == TextureDimension::k2DArray && descriptor.depthOrLastArray == 0);
+    if (!r8 || !oneSlice || descriptor.mipCount != 1 || descriptor.width != surface.target.extent.width || descriptor.height != surface.target.extent.height) return;
     if (surface.stencilSeeded == storage.get() && surface.stencilWriter.lock() == storage) return;
     surface.ApplyFastClear();
     surface.TakeWrites();
