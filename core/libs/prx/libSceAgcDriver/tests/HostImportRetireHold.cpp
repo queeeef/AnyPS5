@@ -331,6 +331,7 @@ int main() {
     _putenv_s("APS5_RELEASE_ON_UNLOCK", "1");
 #else
     setenv("APS5_RELEASE_ON_UNLOCK", "1", 1);
+    setenv("APS5_WRITE_WATCH_IMPORTS", "unwatch", 1);
 #endif
     try {
         IdleRetireOutlivesTheHold();
