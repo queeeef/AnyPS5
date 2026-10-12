@@ -480,8 +480,17 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
 DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, bool& memoized) {
     memoized = false;
     if (resource.dccAddress == 0) return DccKeys::Uncompressed;
-    const auto keys = readDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
+    auto keys = readDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
     if (keys == DccKeys::Uncompressed) return keys;
+    const auto decodable = [&](DccKeys candidate) {
+        std::byte check[16]{};
+        return IsDccClear(candidate) && FillDccClear(ResolveTextureFormat(resource.format), candidate, resource.dccAlphaOnMsb, std::span(check, std::min<std::size_t>(sizeof(check), BytesPerElement(resource.format))));
+    };
+    if (!memoized && !decodable(keys) && std::getenv("APS5_LOCAL_NO_TEXTURE_KEY_WAIT") == nullptr) {
+        if (const auto known = WaitForKeyWriters(resource, guestBytes)) keys = *known;
+        else keys = readDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
+        if (keys == DccKeys::Uncompressed) return keys;
+    }
     if (IsConvertedTextureFormat(resource.format) && (keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110)) throw std::runtime_error(std::string("AGC graphics: DCC clear code ") + DccKeysName(keys) + " of converted texture format " + std::to_string(resource.format) + " is not implemented");
     std::byte probe[16]{};
     if (!IsDccClear(keys) || !FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, std::span(probe, std::min<std::size_t>(sizeof(probe), BytesPerElement(resource.format))))) {
@@ -525,7 +534,7 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
                     }
                 }
                 const bool pending = Recorder::SnapshotWriteOverlaps(resource.dccAddress, keyBytes);
-                std::fprintf(stderr, "[local-dcc] keys of 0x%llx at 0x%llx: %zu key bytes, %ux%u tile %u mips %u pipe-aligned %d; %s; recorded GPU writes over the keys: %s; values%s; runs%s\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(resource.dccAddress), keyBytes, resource.width, resource.height, static_cast<unsigned>(resource.tileMode), resource.mipCount, resource.dccPipeAligned ? 1 : 0, asTarget.c_str(), pending ? "yes" : "no", text.c_str(), runs.c_str());
+                std::fprintf(stderr, "[local-dcc] keys of 0x%llx at 0x%llx: %zu key bytes, %ux%u tile %u mips %u pipe-aligned %d; %s; recorded GPU writes over the keys: %s, GPU lock %s; values%s; runs%s\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(resource.dccAddress), keyBytes, resource.width, resource.height, static_cast<unsigned>(resource.tileMode), resource.mipCount, resource.dccPipeAligned ? 1 : 0, asTarget.c_str(), pending ? "yes" : "no", GuestMemory::GpuMutex().HeldByThisThread() ? "held" : "not held", text.c_str(), runs.c_str());
             }
         }
         return DccKeys::Uncompressed;
