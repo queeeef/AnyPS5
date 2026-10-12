@@ -1183,6 +1183,26 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
     unwatchLocked(tracker, address, bytes);
 }
 
+void Rewatch(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return;
+#ifdef _WIN32
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#else
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(address), bytes);
+    if (!tracker.covers(address, bytes)) return;
+    ++tracker.generation;
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(address + bytes - 1);
+    for (auto block = first; block <= last; ++block) tracker.stamp(block, tracker.generation, StampKind::ImportWindow);
+    unwatchSerial.fetch_add(1, std::memory_order_release);
+#endif
+}
+
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return import();
     auto& tracker = Tracker();
