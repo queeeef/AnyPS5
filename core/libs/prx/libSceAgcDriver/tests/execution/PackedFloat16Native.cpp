@@ -202,9 +202,6 @@ int main() {
             }
             Require(!emulatedMath.add && !emulatedMath.mul && !emulatedMath.fma, std::string("packed f16 native: ") + mode.name + " uses f16vec2 math without Float16");
 
-            // Exercise the slow repair path in every invocation and both packed halves. The
-            // emulated target keeps the existing rule expansion and serves as the differential
-            // reference for the native-f16 guarded lowering.
             for (std::uint32_t tid = 0u; tid < Threads; ++tid) {
                 std::uint32_t* row = &Input[tid * Inputs];
                 row[0] = 0x7f117d01u;
