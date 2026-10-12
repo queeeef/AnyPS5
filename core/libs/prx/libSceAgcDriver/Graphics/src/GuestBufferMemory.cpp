@@ -2888,6 +2888,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     uploaded = true;
+    for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
     // Registered ranges to import from. Address-based shaders hold their lease until write-back;
