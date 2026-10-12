@@ -178,6 +178,7 @@ private:
         }
         _hostRegions = _holes;
         _holes.emplace_back(SystemReservedStart, SystemReservedEnd);
+        WindowsMappings::Get().EnableFaultDebugger(ArenaStart, ApplicationAreaEnd - ArenaStart);
         for (const auto& [holeStart, holeEnd] : _holes) _used.emplace(holeStart, holeEnd);
         _base = ArenaStart;
         _end = end;
