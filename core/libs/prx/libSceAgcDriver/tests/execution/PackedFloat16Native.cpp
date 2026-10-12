@@ -147,14 +147,11 @@ int main() {
         const auto supports = [&](spv::Capability capability) {
             return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end();
         };
-        if (!supports(spv::CapabilityFloat16) || !supports(spv::CapabilityRoundingModeRTE) || !supports(spv::CapabilityDenormPreserve)) {
-            std::puts("packed f16 native: skipped, the device has no native f16 with RTE rounding and kept denormals");
-            return VulkanTestSkipped;
-        }
+        const bool hasNativeF16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
         std::vector<std::uint32_t> withoutFloat16;
         std::ranges::copy_if(target.supportedCapabilities, std::back_inserter(withoutFloat16), [](std::uint32_t capability) { return capability != spv::CapabilityFloat16; });
         auto emulatedTarget = target;
-        emulatedTarget.supportedCapabilities = withoutFloat16;
+        if (hasNativeF16) emulatedTarget.supportedCapabilities = withoutFloat16;
 
         const std::span<const std::uint32_t> code(Code);
         std::vector<std::uint32_t> userData(8, 0u);
@@ -188,9 +185,53 @@ int main() {
             const auto emulated = compile(emulatedTarget, mode);
             const F16x2Math nativeMath = FindF16x2Math(native.spirv.Words());
             const F16x2Math emulatedMath = FindF16x2Math(emulated.spirv.Words());
-            Require(nativeMath.add && nativeMath.mul, std::string("packed f16 native: ") + mode.name + " does not use f16vec2 add and mul");
-            Require(!nativeMath.fma, std::string("packed f16 native: ") + mode.name + " uses an f16vec2 Fma, which Vulkan does not require to be fused");
+            if (!mode.floatMode.has_value()) {
+                if (hasNativeF16) {
+                    std::printf("packed f16 test shader SPIR-V words: guarded native=%zu, existing f32 rules=%zu\n",
+                        native.spirv.Words().size(), emulated.spirv.Words().size());
+                } else {
+                    std::printf("packed f16 test shader SPIR-V words on a device without native f16: %zu\n", native.spirv.Words().size());
+                }
+            }
+            if (hasNativeF16) {
+                Require(nativeMath.add && nativeMath.mul, std::string("packed f16 native: ") + mode.name + " does not use f16vec2 add and mul");
+                Require(!nativeMath.fma, std::string("packed f16 native: ") + mode.name + " uses an f16vec2 Fma, which Vulkan does not require to be fused");
+            } else {
+                Require(!nativeMath.add && !nativeMath.mul && !nativeMath.fma,
+                    std::string("packed f16 native: ") + mode.name + " uses native f16 without required Vulkan capabilities");
+            }
             Require(!emulatedMath.add && !emulatedMath.mul && !emulatedMath.fma, std::string("packed f16 native: ") + mode.name + " uses f16vec2 math without Float16");
+
+            // Exercise the slow repair path in every invocation and both packed halves. The
+            // emulated target keeps the existing rule expansion and serves as the differential
+            // reference for the native-f16 guarded lowering.
+            for (std::uint32_t tid = 0u; tid < Threads; ++tid) {
+                std::uint32_t* row = &Input[tid * Inputs];
+                row[0] = 0x7f117d01u;
+                row[1] = 0x3c003c00u;
+                row[2] = 0x40004000u;
+                row[3] = 0x38003800u;
+            }
+            const auto nativeSpecialOutput = run(native);
+            const auto emulatedSpecialOutput = run(emulated);
+            for (std::uint32_t tid = 0u; tid < Threads; ++tid) {
+                for (std::uint32_t index = 0u; index < Results; ++index) {
+                    const std::uint32_t actual = nativeSpecialOutput[tid * Results + index];
+                    const std::uint32_t expected = emulatedSpecialOutput[tid * Results + index];
+                    const std::uint32_t* row = &Input[tid * Inputs];
+                    Require(actual == expected, std::string("packed f16 native: all-lanes slow path, ") + mode.name + ", " + Names[index]
+                        + " with v4=" + Hex(row[0]) + " v5=" + Hex(row[1]) + " v6=" + Hex(row[2]) + " v7=" + Hex(row[3])
+                        + " is " + Hex(actual) + ", current rules give " + Hex(expected));
+                    if (!hasNativeF16 && index < 3u) {
+                        const std::uint32_t wanted = mode.floatMode.has_value() && mode.floatMode->ieeeMode ? 0x7f117f01u : 0x7f117d01u;
+                        Require(actual == wanted, std::string("packed f16 native: all-lanes slow path, ") + mode.name + ", " + Names[index]
+                            + " is " + Hex(actual) + ", existing special-value rules give " + Hex(wanted));
+                    }
+                }
+            }
+            compared += Threads * Results * 2u;
+
+            if (!hasNativeF16) continue;
             for (std::uint32_t batch = 0; batch < Batches; ++batch) {
                 for (auto& word : Input) word = Half() | (Half() << 16u);
                 const auto nativeOutput = run(native);

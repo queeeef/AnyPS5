@@ -1452,6 +1452,119 @@ std::uint32_t EmitFPMul16x2(SpirvEmitterState& state, std::uint32_t arg0, std::u
     return Unary(state, spv::OpBitcast, TypeU32(state), Exact(state, product));
 }
 
+std::uint32_t EmitFPPackedF16Rules(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2, std::uint32_t fast, const IrValue* flags) {
+    const std::uint32_t mode = flags->ImmediateU32();
+    const bool hasThird = (mode & 1u) != 0u;
+    const bool ieee = (mode & 2u) != 0u;
+    const bool fp16Overflow = (mode & 4u) != 0u;
+    const bool native = (mode & 8u) != 0u;
+    const bool clamp = (mode & 16u) != 0u;
+    const bool dx10Clamp = (mode & 32u) != 0u;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto inputCount = hasThird ? 3u : 2u;
+    const std::array<std::uint32_t, 3> inputs{arg0, arg1, arg2};
+    const auto op = [&](std::uint32_t opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, u32, lhs, rhs); };
+    const auto test = [&](std::uint32_t opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, boolean, lhs, rhs); };
+
+    // In DX10 clamp mode the old native-f16 lowering intentionally bypasses the special-value
+    // rules and lets the final clamp handle the result.
+    if (native && clamp && dx10Clamp) return fast;
+
+    std::uint32_t nanWords = op(spv::OpBitwiseAnd, arg0, ConstantU32(state, 0x7fff7fffu));
+    nanWords = op(spv::OpIAdd, nanWords, ConstantU32(state, 0x03ff03ffu));
+    for (std::uint32_t index = 1u; index < inputCount; ++index) {
+        const auto candidate = op(spv::OpIAdd,
+            op(spv::OpBitwiseAnd, inputs[index], ConstantU32(state, 0x7fff7fffu)),
+            ConstantU32(state, 0x03ff03ffu));
+        nanWords = op(spv::OpBitwiseOr, nanWords, candidate);
+    }
+    const auto resultCandidate = op(spv::OpIAdd,
+        op(spv::OpBitwiseAnd, fast, ConstantU32(state, 0x7fff7fffu)),
+        ConstantU32(state, 0x03ff03ffu));
+    nanWords = op(spv::OpBitwiseOr, nanWords, resultCandidate);
+    const auto anyNan = test(spv::OpINotEqual,
+        op(spv::OpBitwiseAnd, nanWords, ConstantU32(state, 0x80008000u)), ConstantU32(state, 0u));
+
+    std::uint32_t guard = anyNan;
+    if (native && fp16Overflow) {
+        std::uint32_t overflow = ConstantBool(state, false);
+        for (std::uint32_t half = 0u; half < 2u; ++half) {
+            const auto lane = half == 0u
+                ? op(spv::OpBitwiseAnd, fast, ConstantU32(state, 0xffffu))
+                : op(spv::OpShiftRightLogical, fast, ConstantU32(state, 16u));
+            std::uint32_t laneOverflow = test(spv::OpIEqual,
+                op(spv::OpBitwiseAnd, lane, ConstantU32(state, 0x7fffu)), ConstantU32(state, 0x7c00u));
+            for (std::uint32_t index = 0u; index < inputCount; ++index) {
+                const auto source = half == 0u
+                    ? op(spv::OpBitwiseAnd, inputs[index], ConstantU32(state, 0xffffu))
+                    : op(spv::OpShiftRightLogical, inputs[index], ConstantU32(state, 16u));
+                const auto sourceIsInf = test(spv::OpIEqual,
+                    op(spv::OpBitwiseAnd, source, ConstantU32(state, 0x7fffu)), ConstantU32(state, 0x7c00u));
+                laneOverflow = Binary(state, spv::OpLogicalAnd, boolean, laneOverflow,
+                    Unary(state, spv::OpLogicalNot, boolean, sourceIsInf));
+            }
+            overflow = Binary(state, spv::OpLogicalOr, boolean, overflow, laneOverflow);
+        }
+        guard = Binary(state, spv::OpLogicalOr, boolean, guard, overflow);
+    }
+
+    return EmitValueOrDefaultIfCondition(state, guard, u32, fast, [&] {
+        const auto laneRules = [&](std::uint32_t half) {
+            std::array<std::uint32_t, 3> bits{};
+            for (std::uint32_t index = 0u; index < inputCount; ++index) {
+                bits[index] = half == 0u
+                    ? op(spv::OpBitwiseAnd, inputs[index], ConstantU32(state, 0xffffu))
+                    : op(spv::OpShiftRightLogical, inputs[index], ConstantU32(state, 16u));
+            }
+            const auto lane = half == 0u
+                ? op(spv::OpBitwiseAnd, fast, ConstantU32(state, 0xffffu))
+                : op(spv::OpShiftRightLogical, fast, ConstantU32(state, 16u));
+            const auto magnitude = [&](std::uint32_t value) { return op(spv::OpBitwiseAnd, value, ConstantU32(state, 0x7fffu)); };
+            const auto isNan = [&](std::uint32_t value) { return test(spv::OpUGreaterThan, magnitude(value), ConstantU32(state, 0x7c00u)); };
+            const auto isSnan = [&](std::uint32_t value) {
+                return Binary(state, spv::OpLogicalAnd, boolean, isNan(value),
+                    test(spv::OpIEqual, op(spv::OpBitwiseAnd, value, ConstantU32(state, 0x0200u)), ConstantU32(state, 0u)));
+            };
+            const auto quiet = [&](std::uint32_t value) {
+                return ieee ? op(spv::OpBitwiseOr, value, ConstantU32(state, 0x0200u)) : value;
+            };
+            const auto infZero = [&](std::uint32_t inf, std::uint32_t zero) {
+                const auto left = test(spv::OpIEqual, magnitude(inf), ConstantU32(state, 0x7c00u));
+                const auto right = test(spv::OpIEqual, magnitude(zero), ConstantU32(state, 0u));
+                return Binary(state, spv::OpLogicalAnd, boolean, left, right);
+            };
+            const auto invalidProduct = Binary(state, spv::OpLogicalOr, boolean,
+                infZero(bits[0], bits[1]), infZero(bits[1], bits[0]));
+
+            std::uint32_t value = lane;
+            if (native && fp16Overflow) {
+                std::uint32_t overflowLane = test(spv::OpIEqual, magnitude(value), ConstantU32(state, 0x7c00u));
+                for (std::uint32_t index = 0u; index < inputCount; ++index) {
+                    overflowLane = Binary(state, spv::OpLogicalAnd, boolean, overflowLane,
+                        test(spv::OpINotEqual, magnitude(bits[index]), ConstantU32(state, 0x7c00u)));
+                }
+                const auto limited = op(spv::OpBitwiseOr,
+                    op(spv::OpBitwiseAnd, value, ConstantU32(state, 0x8000u)), ConstantU32(state, 0x7bffu));
+                value = Select(state, u32, overflowLane, limited, value);
+            }
+            value = Select(state, u32, isNan(value), ConstantU32(state, 0xfe00u), value);
+            for (std::uint32_t index = inputCount; index-- > 0u;) {
+                std::uint32_t selected = isNan(bits[index]);
+                if (index == 2u) {
+                    selected = Binary(state, spv::OpLogicalAnd, boolean, selected,
+                        Unary(state, spv::OpLogicalNot, boolean, invalidProduct));
+                }
+                value = Select(state, u32, selected, quiet(bits[index]), value);
+            }
+            return value;
+        };
+        const auto low = laneRules(0u);
+        const auto high = laneRules(1u);
+        return op(spv::OpBitwiseOr, low, op(spv::OpShiftLeftLogical, high, ConstantU32(state, 16u)));
+    });
+}
+
 std::uint32_t EmitF32ToF16BitsRte(SpirvEmitterState& state, std::uint32_t value) {
     if (NativeF16Rte(state)) return EmitNativeF32ToF16BitsRte(state, value);
     const auto u32 = TypeU32(state);
