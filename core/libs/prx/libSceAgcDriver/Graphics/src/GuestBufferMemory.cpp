@@ -150,6 +150,7 @@ struct HostImports {
     std::map<std::uint64_t, HostImport> imports;
     std::uint64_t liveBytes = 0;
     std::set<std::uint64_t> failed;
+    std::set<std::pair<std::uint64_t, std::uint64_t>> failedSpans;
     std::set<std::uint64_t> unaliasedSpans;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
@@ -607,14 +608,81 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 bool importsStale(const Context& context, const HostImports& state);
 
-const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease) {
-    if (!importsStale(context, state)) {
-        if (const auto* current = findImport(state, address, address + 1)) return current;
+// TODO(technical debt): local diagnostic, names why a range gets no host import (once per base).
+void noteImportRefused(std::uint64_t base, std::uint64_t bytes, const char* reason, unsigned long state = 0, unsigned long protect = 0, unsigned long type = 0) {
+    static std::mutex mutex;
+    static std::set<std::pair<std::uint64_t, const char*>> seen;
+    std::lock_guard lock(mutex);
+    if (!seen.insert({base, reason}).second || seen.size() > 4096) return;
+    std::fprintf(stderr, "[import-refused] 0x%llx+0x%llx %s (state 0x%lx protect 0x%lx type 0x%lx)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), reason, state, protect, type);
+}
+
+const GuestAllocations::Range* leasedRangeAt(const GuestAllocations::Lease& lease, std::uint64_t base);
+
+// Whether every range a spanning import was made over is still the registered one at its address.
+bool rangesStillLeased(const HostImport& entry, const GuestAllocations::Lease& lease) {
+    for (const auto& range : entry.ranges) {
+        if (leasedRangeAt(lease, range->address) != range.get()) return false;
     }
+    return !entry.ranges.empty();
+}
+
+const HostImport* importRunAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, ImportRun run, bool spanning);
+
+const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease) {
+    if (const auto* current = findImport(state, address, address + 1); current != nullptr && (!importsStale(context, state) || (current->spanning && rangesStillLeased(*current, lease)))) return current;
     auto run = importRun(lease, address);
     if (run.ranges.empty()) return nullptr;
+    return importRunAllocation(context, state, address, lease, std::move(run), false);
+}
+
+// TODO(technical debt): local WIP. A region crossing registered ranges that no windowed run joins
+// gets one import over the whole contiguous ranges it touches, grown over the imports it overlaps
+// so that two spanning imports never retire each other; null across a gap or a flag change.
+const HostImport* spanningImport(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
+    std::uint64_t low = begin;
+    std::uint64_t high = end;
+    for (int round = 0; round < 16; ++round) {
+        auto it = state.imports.upper_bound(low);
+        if (it != state.imports.begin()) --it;
+        for (; it != state.imports.end() && it->first < high; ++it) {
+            if (it->second.base + it->second.bytes <= low) continue;
+            low = std::min(low, it->second.base);
+            high = std::max(high, it->second.base + it->second.bytes);
+        }
+        const auto first = leasedIndexContaining(lease, low);
+        if (first == lease.size()) {
+            noteImportRefused(begin, end - begin, "span: unregistered");
+            return nullptr;
+        }
+        auto last = first;
+        while (lease[last]->address + lease[last]->bytes < high) {
+            if (last + 1 == lease.size() || !continuesRun(*lease[last], *lease[last + 1])) {
+                noteImportRefused(begin, end - begin, last + 1 < lease.size() && lease[last]->address + lease[last]->bytes == lease[last + 1]->address ? "span: flags differ" : "span: gap");
+                return nullptr;
+            }
+            ++last;
+        }
+        const auto runLow = lease[first]->address;
+        const auto runHigh = lease[last]->address + lease[last]->bytes;
+        if (runLow == low && runHigh == high) {
+            ImportRun run{runLow, runHigh - runLow, {}};
+            run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+            return importRunAllocation(context, state, begin, lease, std::move(run), true);
+        }
+        low = runLow;
+        high = runHigh;
+    }
+    return nullptr;
+}
+
+const HostImport* importRunAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, ImportRun run, bool spanning) {
     const auto base = run.base;
     const auto bytes = run.bytes;
+    const auto markFailed = [&] {
+        if (spanning) state.failedSpans.insert({base, bytes});
+        else state.failed.insert(base);
+    };
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
         if (sameRun(found->second, run)) return &found->second;
         retireImport(context.device, state, found, lease);
@@ -626,7 +694,11 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) retireImport(context.device, state, std::prev(it), lease);
     const auto alignment = context.hostImportAlignment;
-    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
+    const bool failedBefore = spanning ? state.failedSpans.contains({base, bytes}) : state.failed.contains(base);
+    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || failedBefore) {
+        if (alignment != 0 && !failedBefore) noteImportRefused(base, bytes, "misaligned");
+        return nullptr;
+    }
     // Pinned imports count against the driver's system memory budget; past it ordinary host
     // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
     // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
@@ -650,6 +722,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     entry.range = run.ranges.front();
     entry.ranges = std::move(run.ranges);
+    entry.spanning = spanning;
 #ifdef _WIN32
     // Drivers pin imported pages, so every page must be committed and accessible.
     bool writable = true;
@@ -658,7 +731,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-            state.failed.insert(base);
+            noteImportRefused(base, bytes, "inaccessible page", info.State, info.Protect, info.Type);
+            markFailed();
             return nullptr;
         }
         const auto protection = info.Protect & 0xffu;
@@ -670,7 +744,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
     if (!writable && readOnly) {
-        state.failed.insert(base);
+        noteImportRefused(base, bytes, "read-only");
+        markFailed();
         return nullptr;
     }
     if (!writable) {
@@ -683,13 +758,18 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
             entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
         } catch (const std::runtime_error&) {
             if (entry.ranges.size() == 1) throw;
+            if (spanning) {
+                noteImportRefused(base, bytes, "span: no alias");
+                markFailed();
+                return nullptr;
+            }
             state.unaliasedSpans.insert(base);
             return importAllocation(context, state, address, lease);
         }
     }
 #else
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) {
-        state.failed.insert(base);
+        markFailed();
         return nullptr;
     }
 #endif
@@ -709,7 +789,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
-        state.failed.insert(base);
+        markFailed();
         std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
 #ifdef _WIN32
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -784,9 +864,10 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
     state.refreshedGeneration = generation;
+    state.failedSpans.clear();
     for (auto it = state.imports.begin(); it != state.imports.end();) {
         const auto* range = leasedRangeAt(lease, it->first);
-        if (range != nullptr && sameRange(it->second, lease)) {
+        if (range != nullptr && (it->second.spanning ? rangesStillLeased(it->second, lease) : sameRange(it->second, lease))) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
@@ -2940,6 +3021,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
                 if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, importRanges());
+                else if (importRun(importRanges(), region.begin).ranges.empty()) noteImportRefused(region.begin, region.end - region.begin, "unregistered");
+                else if ((entry = spanningImport(context, state, region.begin, region.end, importRanges())) != nullptr) noteImportRefused(entry->base, entry->bytes, "span: imported");
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
