@@ -272,6 +272,26 @@ void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
 
 }
 
+namespace {
+struct LocalColorDcc {
+    std::uint64_t dcc;
+    bool mipmapped;
+};
+std::mutex& LocalColorDccMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+std::unordered_map<std::uint64_t, LocalColorDcc>& LocalColorDccs() {
+    static std::unordered_map<std::uint64_t, LocalColorDcc> map;
+    return map;
+}
+}
+
+void LocalNoteColorDcc(std::uint64_t base, std::uint64_t dcc, bool mipmapped) {
+    std::lock_guard lock(LocalColorDccMutex());
+    LocalColorDccs()[base] = {dcc, mipmapped};
+}
+
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys) {
     static const bool disabled = std::getenv("APS5_NO_KEYS_FILL_MEMO") != nullptr;
     if (disabled || count == 0) return;
@@ -495,7 +515,17 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
                     ++runCount;
                     i = j;
                 }
-                std::fprintf(stderr, "[local-dcc] keys of 0x%llx: %zu key bytes, %ux%u tile %u mips %u pipe-aligned %d, values%s; runs%s\n", static_cast<unsigned long long>(resource.baseAddress), keyBytes, resource.width, resource.height, static_cast<unsigned>(resource.tileMode), resource.mipCount, resource.dccPipeAligned ? 1 : 0, text.c_str(), runs.c_str());
+                std::string asTarget = "never bound as a color target";
+                {
+                    std::lock_guard lock(LocalColorDccMutex());
+                    if (const auto found = LocalColorDccs().find(resource.baseAddress); found != LocalColorDccs().end()) {
+                        char item[160];
+                        std::snprintf(item, sizeof(item), "as a color target: dcc 0x%llx (%s)%s", static_cast<unsigned long long>(found->second.dcc), found->second.dcc == resource.dccAddress ? "same" : "DIFFERENT", found->second.mipmapped ? ", mipmapped, keys ignored" : "");
+                        asTarget = item;
+                    }
+                }
+                const bool pending = Recorder::SnapshotWriteOverlaps(resource.dccAddress, keyBytes);
+                std::fprintf(stderr, "[local-dcc] keys of 0x%llx at 0x%llx: %zu key bytes, %ux%u tile %u mips %u pipe-aligned %d; %s; recorded GPU writes over the keys: %s; values%s; runs%s\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(resource.dccAddress), keyBytes, resource.width, resource.height, static_cast<unsigned>(resource.tileMode), resource.mipCount, resource.dccPipeAligned ? 1 : 0, asTarget.c_str(), pending ? "yes" : "no", text.c_str(), runs.c_str());
             }
         }
         return DccKeys::Uncompressed;
