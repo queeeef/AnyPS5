@@ -186,9 +186,37 @@ public:
         const auto offset = view->second.offset;
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
+        struct Run {
+            HANDLE handle;
+            std::uint64_t offset;
+            std::size_t bytes;
+        };
+        std::vector<Run> runs;
         for (std::size_t done = 0; done < bytes; done += pageBytes, ++view) {
-            if (view == views.end() || view->first != address + done || view->second.offset != offset + done) throw refuse("the range is not one contiguous run of views of a section");
-            if (view->second.section != section && !sameSection(view->second.section->handle, section->handle)) throw refuse("the range spans several sections");
+            if (view == views.end() || view->first != address + done) throw refuse("the range is not made of shared views only");
+            const auto handle = view->second.section->handle;
+            if (!runs.empty() && runs.back().offset + runs.back().bytes == view->second.offset && (runs.back().handle == handle || sameSection(runs.back().handle, handle))) runs.back().bytes += pageBytes;
+            else runs.push_back({handle, view->second.offset, pageBytes});
+        }
+        if (runs.size() > 1) {
+            auto* reserved = static_cast<char*>(allocate(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+            if (reserved == nullptr) throw refuse("no placeholder for a multi-run alias");
+            std::vector<void*> mapped;
+            std::size_t at = 0;
+            for (std::size_t index = 0; index < runs.size(); ++index) {
+                auto* place = reserved + at;
+                const bool split = index + 1 == runs.size() || VirtualFree(place, runs[index].bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                if (!split || !map(runs[index].handle, GetCurrentProcess(), place, runs[index].offset, runs[index].bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
+                    for (auto* piece : mapped) unmap(GetCurrentProcess(), piece, MEM_PRESERVE_PLACEHOLDER);
+                    VirtualFree(reserved, bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+                    VirtualFree(reserved, 0, MEM_RELEASE);
+                    throw refuse("a run of a multi-run alias did not map");
+                }
+                mapped.push_back(place);
+                at += runs[index].bytes;
+            }
+            spanAliases.emplace(reserved, std::move(mapped));
+            return reserved;
         }
         const auto lead = offset % system.dwAllocationGranularity;
         void* alias = map(section->handle, GetCurrentProcess(), nullptr, offset - lead, lead + bytes, 0, PAGE_READWRITE, nullptr, 0);
@@ -202,6 +230,16 @@ public:
 
     void UnmapAlias(void* alias) {
         if (alias == nullptr) return;
+        {
+            std::lock_guard lock(mutex);
+            if (const auto found = spanAliases.find(alias); found != spanAliases.end()) {
+                for (auto* piece : found->second) {
+                    if (!unmap(GetCurrentProcess(), piece, 0)) fail("unmap shared guest alias run");
+                }
+                spanAliases.erase(found);
+                return;
+            }
+        }
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         const auto base = reinterpret_cast<std::uintptr_t>(alias) & ~(static_cast<std::uintptr_t>(system.dwAllocationGranularity) - 1);
@@ -433,6 +471,7 @@ private:
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
     CompareFunction compare = nullptr;
+    std::map<void*, std::vector<void*>> spanAliases;
 };
 
 }

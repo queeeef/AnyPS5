@@ -289,6 +289,32 @@ static void CheckDirectMemoryFollowsPhysicalPages() {
     Require(sceKernelReleaseDirectMemory(again, page * 2) == 0);
 }
 
+#ifdef _WIN32
+static void CheckReadWriteAliasOfReorderedDirectPages() {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &phys) == 0);
+    void* reserved = nullptr;
+    Require(sceKernelReserveVirtualRange(&reserved, page * 2, 0, 0) == 0);
+    auto* guest = static_cast<unsigned char*>(reserved);
+    void* high = guest;
+    Require(sceKernelMapDirectMemory(&high, page, 3, 0x10, phys + page, 0) == 0 && high == guest);
+    void* low = guest + page;
+    Require(sceKernelMapDirectMemory(&low, page, 3, 0x10, phys, 0) == 0 && low == guest + page);
+    guest[5] = 31;
+    guest[page + 6] = 42;
+    auto* alias = static_cast<unsigned char*>(GuestArena::GuestArenaMapAlias_nid_postfix(reinterpret_cast<std::uintptr_t>(guest), page * 2));
+    Require(alias != nullptr && alias[5] == 31 && alias[page + 6] == 42);
+    alias[7] = 53;
+    alias[page + 8] = 64;
+    Require(guest[7] == 53 && guest[page + 8] == 64);
+    GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
+    Require(guest[5] == 31 && guest[page + 8] == 64);
+    Require(sceKernelMunmap(guest, page * 2) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
+}
+#endif
+
 static void CheckReleaseDirectMemoryClearsMappings() {
     constexpr std::size_t page = 0x4000;
     std::int64_t phys = 0;
@@ -1715,6 +1741,9 @@ int main() {
     CheckCheckedReleaseDirectMemory();
     CheckAudioCoprocessorProtection();
     CheckDirectMemoryFollowsPhysicalPages();
+#ifdef _WIN32
+    CheckReadWriteAliasOfReorderedDirectPages();
+#endif
     CheckReleaseDirectMemoryClearsMappings();
     CheckReleaseDirectMemoryRejectsInvalidRanges();
     CheckFixedMappingReplacesPartialOverlap();
