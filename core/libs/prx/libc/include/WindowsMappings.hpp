@@ -3,8 +3,11 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libc/include/FaultDebuggerShared.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -56,6 +59,7 @@ public:
                 if (mapped != views.end()) {
                     mapped->second.protection = protection;
                     mapped->second.armed = false;
+                    markFault(mapped->first, FaultDebugger::Disarmed);
                     invalidate(*mapped->second.page);
                 }
                 DWORD previous;
@@ -64,6 +68,56 @@ public:
             }
         }
         return created;
+    }
+
+    void EnableFaultDebugger(std::uintptr_t base, std::size_t bytes) {
+        if (std::getenv("APS5_FAULT_DEBUGGER") == nullptr || faultHeader != nullptr) return;
+        const auto pid = GetCurrentProcessId();
+        const auto pages = bytes / pageBytes;
+        const auto size = static_cast<std::uint64_t>(sizeof(FaultDebugger::Header)) + pages;
+        char name[64];
+        FaultDebugger::MappingName(name, sizeof(name), pid);
+        HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<DWORD>(size >> 32u), static_cast<DWORD>(size), name);
+        if (mapping == nullptr) {
+            std::fprintf(stderr, "[fault-debugger] no shared table (%lu); write faults stay with the vectored handler\n", GetLastError());
+            return;
+        }
+        auto* header = static_cast<FaultDebugger::Header*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0));
+        if (header == nullptr) return;
+        header->magic = FaultDebugger::Magic;
+        header->base = base;
+        header->pages = pages;
+        header->pageBytes = pageBytes;
+        FaultDebugger::ReadyName(name, sizeof(name), pid);
+        HANDLE ready = CreateEventA(nullptr, TRUE, FALSE, name);
+        HMODULE module = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&WindowsMappings::Get), &module);
+        char path[MAX_PATH];
+        const auto length = GetModuleFileNameA(module, path, MAX_PATH);
+        std::string helper(path, length);
+        helper = helper.substr(0, helper.find_last_of("\\/") + 1) + "aps5-faultd.exe";
+        std::string command = "\"" + helper + "\" " + std::to_string(pid);
+        STARTUPINFOA startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        if (ready == nullptr || !CreateProcessA(helper.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+            std::fprintf(stderr, "[fault-debugger] cannot start %s (%lu); write faults stay with the vectored handler\n", helper.c_str(), GetLastError());
+            return;
+        }
+        CloseHandle(process.hThread);
+        if (WaitForSingleObject(ready, 15000) != WAIT_OBJECT_0 || header->attached == 0) {
+            std::fprintf(stderr, "[fault-debugger] %s did not attach; write faults stay with the vectored handler\n", helper.c_str());
+            return;
+        }
+        faultHeader = header;
+        faultTable = FaultDebugger::Table(header);
+        faultBase = base;
+        faultPages = pages;
+        std::fprintf(stderr, "[fault-debugger] %s attached: shared-page write faults are resumed by the debugger\n", helper.c_str());
+    }
+
+    std::uint64_t FaultDebuggerHandled() const {
+        return faultHeader != nullptr ? faultHeader->handled : 0;
     }
 
     void Reset(void* address, std::size_t bytes) {
@@ -95,6 +149,7 @@ public:
             }
             const auto base = cursor + done;
             shared->aliases.push_back(base);
+            markFault(base, FaultDebugger::Disarmed);
             views.emplace(base, View{shared, protection, 0, false, owned, offset + done, 0});
             invalidate(*shared);
         }
@@ -105,12 +160,14 @@ public:
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = false;
+            markFault(it->first, FaultDebugger::Disarmed);
             invalidate(*it->second.page);
         }
     }
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        drainFaults();
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
             ++page.pins;
@@ -118,6 +175,7 @@ public:
                 auto& view = views.at(alias);
                 if (!view.armed) continue;
                 DWORD previous;
+                markFault(alias, FaultDebugger::Disarmed);
                 if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, view.protection, &previous)) fail("pin shared guest page writable");
                 view.armed = false;
             }
@@ -136,12 +194,14 @@ public:
 
     bool HandleWrite(std::uintptr_t address) {
         std::lock_guard lock(mutex);
+        drainFaults();
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
         if (found == views.end() || !writable(found->second.protection)) return false;
         auto& view = found->second;
         invalidate(*view.page);
         DWORD previous;
+        markFault(base, FaultDebugger::Disarmed);
         if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume shared memory write");
         view.armed = false;
         return true;
@@ -149,6 +209,7 @@ public:
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        drainFaults();
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -160,6 +221,7 @@ public:
             invalidate(*view.page);
             if (!view.armed) continue;
             DWORD previous;
+            markFault(it->first, FaultDebugger::Disarmed);
             if (!VirtualProtect(reinterpret_cast<void*>(it->first), pageBytes, view.protection, &previous)) fail("open shared memory to a host write");
             view.armed = false;
         }
@@ -233,6 +295,7 @@ public:
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
         std::lock_guard lock(mutex);
+        drainFaults();
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -267,6 +330,7 @@ public:
                         if (!writable(other.protection) || other.armed || other.hostWrites != 0) continue;
                         DWORD previous;
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+                        markFault(alias, other.protection == PAGE_EXECUTE_READWRITE ? FaultDebugger::ArmedExecuteReadWrite : FaultDebugger::ArmedReadWrite);
                         if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
                         other.armed = true;
                     }
@@ -291,6 +355,34 @@ public:
     }
 
 private:
+    void markFault(std::uintptr_t base, std::uint8_t state) {
+        if (faultTable == nullptr || base < faultBase) return;
+        const auto index = (base - faultBase) / pageBytes;
+        if (index < faultPages) faultTable[index] = state;
+    }
+
+    void consumeFault(std::uintptr_t base) {
+        const auto found = views.find(base);
+        if (found == views.end()) return;
+        found->second.armed = false;
+        invalidate(*found->second.page);
+    }
+
+    void drainFaults() {
+        if (faultHeader == nullptr) return;
+        const auto head = std::atomic_ref<std::uint64_t>(faultHeader->head).load(std::memory_order_acquire);
+        auto tail = faultHeader->tail;
+        for (; tail < head; ++tail) consumeFault(faultBase + static_cast<std::uintptr_t>(faultHeader->ring[tail % FaultDebugger::RingSize]) * pageBytes);
+        std::atomic_ref<std::uint64_t>(faultHeader->tail).store(tail, std::memory_order_release);
+        if (std::atomic_ref<std::uint32_t>(faultHeader->overflow).exchange(0) != 0) {
+            for (auto& [base, view] : views) {
+                if (!view.armed || base < faultBase) continue;
+                const auto index = (base - faultBase) / pageBytes;
+                if (index < faultPages && faultTable[index] == FaultDebugger::Disarmed) consumeFault(base);
+            }
+        }
+    }
+
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
@@ -422,6 +514,7 @@ private:
                 if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(cursor), MEM_PRESERVE_PLACEHOLDER)) fail("unmap shared guest page");
                 const auto found = views.find(cursor);
                 if (found != views.end()) {
+                    markFault(cursor, FaultDebugger::Disarmed);
                     std::erase(found->second.page->aliases, cursor);
                     views.erase(found);
                 }
@@ -481,6 +574,10 @@ private:
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
     std::mutex mutex;
+    FaultDebugger::Header* faultHeader = nullptr;
+    std::uint8_t* faultTable = nullptr;
+    std::uintptr_t faultBase = 0;
+    std::uint64_t faultPages = 0;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
