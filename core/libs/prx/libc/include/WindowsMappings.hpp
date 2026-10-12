@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstddef>
@@ -142,6 +143,12 @@ public:
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume shared memory write");
         view.armed = false;
+        ++resumedWrites;
+        if (const auto now = std::chrono::steady_clock::now(); now - lastFaultReport >= std::chrono::seconds(10)) {
+            std::fprintf(stderr, "[write-faults] %llu resumed shared-page write faults in the last 10 s\n", static_cast<unsigned long long>(resumedWrites - reportedWrites));
+            reportedWrites = resumedWrites;
+            lastFaultReport = now;
+        }
         return true;
     }
 
@@ -476,6 +483,9 @@ private:
     CompareFunction compare = nullptr;
     // TODO(technical debt): local WIP, the views of aliases made of several section runs (MapAlias).
     std::map<void*, std::vector<void*>> spanAliases;
+    std::uint64_t resumedWrites = 0;
+    std::uint64_t reportedWrites = 0;
+    std::chrono::steady_clock::time_point lastFaultReport = std::chrono::steady_clock::now();
 };
 
 }
