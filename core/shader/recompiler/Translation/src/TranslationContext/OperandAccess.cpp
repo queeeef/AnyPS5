@@ -168,7 +168,7 @@ IrF32 TranslationContext::flushTinyProduct(IrValue* lhs, IrValue* rhs, IrValue* 
         IrValue& scaled = ir.BitwiseAnd(ir.BitCastU32(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&ir.Emit(IrOpcode::FPMul32, IrType::F32, {lhs, &ir.ConstantF32(0x1p64f)}), rhs})), ir.Constant(0x7fffffffu));
         IrValue* tiny = zeroAddend(&ir.ULessThan(ir.ISub(scaled, ir.Constant(1u)), ir.Constant(0x207fffffu)));
         IrValue& sign = ir.BitwiseAnd(ir.BitwiseXor(lhsBits, rhsBits), ir.Constant(0x80000000u));
-        return IrF32(ir.Emit(IrOpcode::SelectF32, IrType::F32, {tiny, &ir.BitCastF32(sign), product}));
+        return IrF32(ir.Emit(IrOpcode::SelectF32, IrType::F32, {tiny, &ir.BitCastF32(sign), product}, SelectFlags{false, addend == nullptr, false}));
     }
     const auto exponent = [&](IrValue& bits) -> IrValue& { return ir.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&bits, &ir.Constant(23u), &ir.Constant(8u)}); };
     const auto significand = [&](IrValue& bits) -> IrValue& { return ir.BitwiseOr(ir.BitwiseAnd(bits, ir.Constant(0x007fffffu)), ir.Constant(0x00800000u)); };
@@ -367,7 +367,7 @@ IrValue* TranslationContext::rareFixupF32(IrValue* plain, IrValue* fixed, bool t
     } else {
         special = &ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {plain});
     }
-    return &ir.Emit(IrOpcode::SelectF32, IrType::F32, {special, fixed, plain}, SelectFlags{true});
+    return &ir.Emit(IrOpcode::SelectF32, IrType::F32, {special, fixed, plain}, SelectFlags{true, false, tinyFlushed});
 }
 
 IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {

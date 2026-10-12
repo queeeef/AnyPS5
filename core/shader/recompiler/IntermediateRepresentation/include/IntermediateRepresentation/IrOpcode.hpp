@@ -526,6 +526,8 @@ struct ExportFlags {
 
 struct SelectFlags {
     bool rarelyTrue = false;
+    bool notDenormal = false;
+    bool falseArmNotDenormal = false;
 };
 
 [[nodiscard]] std::size_t IrOpcodeOperandCount(IrOpcode opcode);
