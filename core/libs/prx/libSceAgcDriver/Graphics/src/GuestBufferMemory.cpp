@@ -3022,7 +3022,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (entry == nullptr) {
                 if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, importRanges());
                 else if (importRun(importRanges(), region.begin).ranges.empty()) noteImportRefused(region.begin, region.end - region.begin, "unregistered");
-                else if (std::getenv("APS5_LOCAL_NO_SPAN") == nullptr && (entry = spanningImport(context, state, region.begin, region.end, importRanges())) != nullptr) noteImportRefused(entry->base, entry->bytes, "span: imported");
+                else if ((entry = spanningImport(context, state, region.begin, region.end, importRanges())) != nullptr) noteImportRefused(entry->base, entry->bytes, "span: imported");
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.

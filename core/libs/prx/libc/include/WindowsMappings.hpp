@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -207,7 +206,6 @@ public:
             if (!runs.empty() && runs.back().offset + runs.back().bytes == view->second.offset && (runs.back().handle == handle || sameSection(runs.back().handle, handle))) runs.back().bytes += pageBytes;
             else runs.push_back({handle, view->second.offset, pageBytes});
         }
-        if (runs.size() > 1 && std::getenv("APS5_LOCAL_NO_SPAN") != nullptr) throw refuse("the range is not one contiguous run of views of a section");
         if (runs.size() > 1) {
             auto* reserved = static_cast<char*>(allocate(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
             if (reserved == nullptr) throw refuse("no placeholder for a multi-run alias");
