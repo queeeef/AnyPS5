@@ -34,6 +34,7 @@ struct HostImport {
     bool unwatched = false;
     bool dmaBuf = false;
     mutable std::uint64_t lastUseFrame = 0;
+    bool joined = false;
     std::shared_ptr<void> chunk;
 };
 
