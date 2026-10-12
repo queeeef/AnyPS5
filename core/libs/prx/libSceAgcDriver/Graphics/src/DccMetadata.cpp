@@ -468,7 +468,25 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
         static std::mutex reportedMutex;
         static std::set<std::pair<std::uint64_t, int>> reported;
         std::lock_guard lock(reportedMutex);
-        if (reported.size() < 32 && reported.insert({resource.baseAddress, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] texture 0x%llx (format %u) has %s DCC keys at 0x%llx; its texels are read as stored\n", static_cast<unsigned long long>(resource.baseAddress), resource.format, DccKeysName(keys), static_cast<unsigned long long>(resource.dccAddress));
+        if (reported.size() < 32 && reported.insert({resource.baseAddress, static_cast<int>(keys)}).second) {
+            std::fprintf(stderr, "[gpu] texture 0x%llx (format %u) has %s DCC keys at 0x%llx; its texels are read as stored\n", static_cast<unsigned long long>(resource.baseAddress), resource.format, DccKeysName(keys), static_cast<unsigned long long>(resource.dccAddress));
+            const auto keyBytes = DccKeyBytes(guestBytes);
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(resource.dccAddress), keyBytes)) {
+                std::array<std::uint64_t, 256> histogram{};
+                const auto* bytes = reinterpret_cast<const std::uint8_t*>(resource.dccAddress);
+                for (std::size_t i = 0; i < keyBytes; ++i) ++histogram[bytes[i]];
+                std::string text;
+                for (int shown = 0; shown < 8; ++shown) {
+                    const auto top = std::max_element(histogram.begin(), histogram.end());
+                    if (*top == 0) break;
+                    char item[32];
+                    std::snprintf(item, sizeof(item), " 0x%02x:%llu", static_cast<unsigned>(top - histogram.begin()), static_cast<unsigned long long>(*top));
+                    text += item;
+                    *top = 0;
+                }
+                std::fprintf(stderr, "[local-dcc] keys of 0x%llx: %zu key bytes, %ux%u tile %u, values%s\n", static_cast<unsigned long long>(resource.baseAddress), keyBytes, resource.width, resource.height, static_cast<unsigned>(resource.tileMode), text.c_str());
+            }
+        }
         return DccKeys::Uncompressed;
     }
     return keys;
