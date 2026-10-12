@@ -11,7 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <tuple>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -463,7 +465,7 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
         return IsDccClear(candidate) && FillDccClear(ResolveTextureFormat(resource.format), candidate, resource.dccAlphaOnMsb, std::span(check, std::min<std::size_t>(sizeof(check), BytesPerElement(resource.format))));
     };
     if (!memoized && !decodable(keys)) {
-        if (const auto known = WaitForKeyWriters(resource, guestBytes)) keys = *known;
+        if (const auto known = WaitForKeyWriters(resource, guestBytes, 1)) keys = *known;
         else keys = readDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
         if (keys == DccKeys::Uncompressed) return keys;
     }
@@ -685,14 +687,15 @@ DccKeys EncodedKeys(const GuestTextureResource& resource, DccKeys keys) {
     return keys;
 }
 
-bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count) {
+std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count) {
     const auto begin = resource.dccAddress;
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return false;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
     auto writes = recorder.PendingWritesOver(begin, count);
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
     int value = -1;
     bool mixed = false;
+    bool unknown = false;
     const auto see = [&](int key) {
         if (value < 0) value = key;
         else if (value != key) mixed = true;
@@ -712,6 +715,7 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
         }
         unwritten = std::move(rest);
         if (covered && write.value >= 0) see(write.value);
+        else if (covered) unknown = true;
     }
     for (const auto& [from, to] : unwritten) {
         if (mixed) break;
@@ -719,20 +723,60 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
         if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
         else mixed = true;
     }
-    return mixed || (value >= 0 && EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value))) == DccKeys::Uncompressed);
+    if (mixed) return DccKeys::Uncompressed;
+    if (unknown || value < 0) return std::nullopt;
+    return EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value)));
 }
 
 }
 
-std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
+std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes, int site) {
     const auto count = static_cast<std::size_t>(guestBytes / KeyBytes);
     const auto metaAddress = resource.dccAddress;
     if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return std::nullopt;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
-    if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    if (const auto predicted = PendingFillKeys(*recorder, resource, count)) return predicted;
     Recorder::CountSync(2);
+    {
+        static std::atomic<int> described{0};
+        if (described.fetch_add(1, std::memory_order_relaxed) < 60) {
+            const auto info = recorder->DescribePendingWrite(metaAddress, count);
+            const auto writes = recorder->PendingWritesOver(metaAddress, count);
+            std::string list;
+            for (std::size_t i = 0; i < writes.size() && i < 4; ++i) {
+                char item[96];
+                std::snprintf(item, sizeof(item), " [0x%llx+0x%llx v%d]", static_cast<unsigned long long>(writes[i].begin), static_cast<unsigned long long>(writes[i].end - writes[i].begin), writes[i].value);
+                list += item;
+            }
+            std::fprintf(stderr, "[local-keysync] %s texture 0x%llx %ux%u fmt %u mips %u, keys 0x%llx+0x%zx; pending range 0x%llx+0x%llx, %zu batches to finish; %zu writes:%s\n", site == 1 ? "sampled" : "storage", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, resource.lastLevel - resource.baseLevel + 1u, static_cast<unsigned long long>(metaAddress), count, info ? static_cast<unsigned long long>(info->rangeBegin) : 0ull, info ? static_cast<unsigned long long>(info->rangeEnd - info->rangeBegin) : 0ull, info ? info->batchesToFinish : 0u, writes.size(), list.c_str());
+        }
+    }
+    const auto started = std::chrono::steady_clock::now();
     recorder->SyncThrough(metaAddress, count);
+    {
+        static std::mutex statsMutex;
+        static std::map<std::tuple<int, std::uint32_t, std::uint32_t, std::uint32_t>, std::pair<std::uint64_t, double>> stats;
+        static auto window = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(statsMutex);
+        auto& entry = stats[{site, resource.width, resource.height, resource.format}];
+        ++entry.first;
+        entry.second += std::chrono::duration<double, std::milli>(now - started).count();
+        if (now - window >= std::chrono::seconds(10)) {
+            std::vector<std::pair<std::tuple<int, std::uint32_t, std::uint32_t, std::uint32_t>, std::pair<std::uint64_t, double>>> rows(stats.begin(), stats.end());
+            std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+            std::string text;
+            for (std::size_t i = 0; i < rows.size() && i < 8; ++i) {
+                char row[128];
+                std::snprintf(row, sizeof(row), " %s %ux%u fmt %u: %llu/%.0fms;", std::get<0>(rows[i].first) == 1 ? "sampled" : "storage", std::get<1>(rows[i].first), std::get<2>(rows[i].first), std::get<3>(rows[i].first), static_cast<unsigned long long>(rows[i].second.first), rows[i].second.second);
+                text += row;
+            }
+            std::fprintf(stderr, "[local-keysync] 10 s:%s\n", text.c_str());
+            stats.clear();
+            window = now;
+        }
+    }
     return std::nullopt;
 }
 
