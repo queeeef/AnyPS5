@@ -10,6 +10,24 @@ add_custom_command(
     VERBATIM
 )
 
+set(agcOutputGammaSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/OutputGamma.comp)
+set(agcOutputGammaSpv ${agcTextureDetileGeneratedDir}/OutputGamma.spv)
+set(agcOutputGammaHeader ${agcTextureDetileGeneratedDir}/OutputGamma_spv.h)
+add_custom_command(
+    OUTPUT "${agcOutputGammaHeader}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+    COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcOutputGammaSpv}" "${agcOutputGammaSource}"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${agcOutputGammaSpv} -DOUTPUT=${agcOutputGammaHeader} -DSYMBOL=OUTPUT_GAMMA_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+    DEPENDS "${agcOutputGammaSource}" glslang-standalone
+    VERBATIM
+)
+
+foreach(agcTarget IN ITEMS libSceAgcDriver agc_driver_visual_test agc_driver_graphics_tests agc_driver_bda_device_tests agc_driver_mesh_tests)
+    if(TARGET ${agcTarget})
+        target_sources(${agcTarget} PRIVATE Execution/src/PresentationGamma.cpp ${agcOutputGammaHeader})
+    endif()
+endforeach()
+
 foreach(agcTarget IN ITEMS libSceAgcDriver agc_driver_visual_test agc_driver_graphics_tests agc_driver_bda_device_tests agc_driver_mesh_tests)
     if(TARGET ${agcTarget})
         target_sources(${agcTarget} PRIVATE Graphics/src/BufferPool.cpp)

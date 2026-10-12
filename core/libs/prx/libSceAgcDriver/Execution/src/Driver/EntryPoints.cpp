@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentationGamma.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include <mutex>
 
@@ -121,6 +122,10 @@ extern "C" void AgcDriverReleaseWindow_nid_postfix(void* window) {
 
 extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
     AgcDriver::ReportFailure(error);
+}
+
+extern "C" void AgcDriverSetOutputGamma_nid_postfix(float gamma) {
+    AgcDriver::SetOutputGamma(gamma);
 }
 
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
