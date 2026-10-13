@@ -160,6 +160,10 @@ struct AddressSpaceStats {
     std::uint64_t dissolvedOverlap = 0;
     std::uint64_t dissolvedImports = 0;
     std::uint64_t waiterDrops = 0;
+    std::uint64_t tablesOfSpace = 0;
+    std::uint64_t tablesByKey = 0;
+    std::uint64_t tablesKeyed = 0;
+    std::uint64_t tablesUnkeyed = 0;
 };
 AddressSpaceStats AddressSpaceCounters();
 
@@ -354,6 +358,8 @@ private:
     // The BDA table entry of an uploaded region.
     static ShaderRecompiler::BdaAbi::Range addressRange(const Region& region);
     static std::uint64_t servedEnd(const Region& region);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> coalescedWrites() const;
+    std::optional<std::vector<std::uint64_t>> tableKey() const;
     void validate(std::uint64_t address, std::size_t bytes) const;
     // The region of a descriptor-bound range (AddWritable/AddReadable), committed pages only. A
     // range inside a base region of the space adds nothing: the region serves it, as today's merge

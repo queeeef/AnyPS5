@@ -27,6 +27,7 @@
 #include <bit>
 #include <condition_variable>
 #include <iterator>
+#include <list>
 #include <map>
 #include <mutex>
 #include <set>
@@ -107,8 +108,15 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<CopiedRange> copied;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    bool rangesOrdered = false;
+    struct KeyedTable {
+        std::uint64_t hash;
+        std::vector<std::uint64_t> key;
+        std::uint64_t serial;
+        std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ranges;
+    };
     mutable std::mutex tableMutex;
-    mutable std::map<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> writeTables;
+    mutable std::list<KeyedTable> keyedTables;
 };
 
 namespace {
@@ -130,6 +138,10 @@ struct AddressSpaceCache {
     std::atomic<std::uint64_t> dissolvedOverlap{0};
     std::atomic<std::uint64_t> dissolvedImports{0};
     std::atomic<std::uint64_t> waiterDrops{0};
+    std::atomic<std::uint64_t> tablesOfSpace{0};
+    std::atomic<std::uint64_t> tablesByKey{0};
+    std::atomic<std::uint64_t> tablesKeyed{0};
+    std::atomic<std::uint64_t> tablesUnkeyed{0};
 };
 
 AddressSpaceCache& Spaces() {
@@ -1822,7 +1834,7 @@ LeaseStats LeaseCounters() {
 AddressSpaceStats AddressSpaceCounters() {
     const auto& cache = Spaces();
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
-    return {addressSpaceCacheEnabled(), load(cache.hits), load(cache.rebuiltFirst), load(cache.rebuiltGeneration), load(cache.rebuiltEpoch), load(cache.rebuiltDevice), load(cache.rebuiltWaiterDrop), load(cache.unpublished), load(cache.dissolvedOverlap), load(cache.dissolvedImports), load(cache.waiterDrops)};
+    return {addressSpaceCacheEnabled(), load(cache.hits), load(cache.rebuiltFirst), load(cache.rebuiltGeneration), load(cache.rebuiltEpoch), load(cache.rebuiltDevice), load(cache.rebuiltWaiterDrop), load(cache.unpublished), load(cache.dissolvedOverlap), load(cache.dissolvedImports), load(cache.waiterDrops), load(cache.tablesOfSpace), load(cache.tablesByKey), load(cache.tablesKeyed), load(cache.tablesUnkeyed)};
 }
 
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit) {
@@ -2256,7 +2268,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
     const auto space = AddressSpaceCounters();
     const auto& spaceSeen = totals.spaceSeen;
-    AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), us per build: table %.0f, fault buffer %.0f; tables by key: the space's own %llu, keyed hits %llu, keyed builds %llu, unkeyed %llu; first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), per(static_cast<double>(table.tableNanoseconds - seen.tableNanoseconds) / 1000.0), per(static_cast<double>(table.faultNanoseconds - seen.faultNanoseconds) / 1000.0), delta(space.tablesOfSpace, spaceSeen.tablesOfSpace), delta(space.tablesByKey, spaceSeen.tablesByKey), delta(space.tablesKeyed, spaceSeen.tablesKeyed), delta(space.tablesUnkeyed, spaceSeen.tablesUnkeyed), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -2432,6 +2444,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
                 built->lease = std::move(lease);
                 built->ranges = std::move(ranges);
+                built->rangesOrdered = std::all_of(built->ranges.begin(), built->ranges.end(), [](const ShaderRecompiler::BdaAbi::Range& range) { return range.begin < range.end; }) && std::adjacent_find(built->ranges.begin(), built->ranges.end(), [](const ShaderRecompiler::BdaAbi::Range& left, const ShaderRecompiler::BdaAbi::Range& right) { return right.begin < left.end; }) == built->ranges.end();
                 std::vector<Region> extras;
                 for (auto& region : regions) {
                     if (region.direct != nullptr || region.mirror != nullptr) {
@@ -3551,13 +3564,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
         result = std::move(combined);
     }
     if (writes.empty()) return result;
-    auto sortedWrites = writes;
-    std::sort(sortedWrites.begin(), sortedWrites.end());
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
-    for (const auto& interval : sortedWrites) {
-        if (!intervals.empty() && interval.first <= intervals.back().second) intervals.back().second = std::max(intervals.back().second, interval.second);
-        else intervals.push_back(interval);
-    }
+    const auto intervals = coalescedWrites();
     std::vector<ShaderRecompiler::BdaAbi::Range> merged;
     merged.reserve(result.size() + intervals.size() * 2u);
     std::size_t firstWrite = 0;
@@ -3591,22 +3598,86 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     return merged;
 }
 
-std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
-    if (space == nullptr || !regions.empty()) return std::nullopt;
-    Require(uploaded && !committed, "guest GPU address ranges are not available");
-    if (writes.empty()) return CachedTable{space->serial, &space->ranges};
-    if (writeTableRanges != nullptr) return CachedTable{writeTableSerial, writeTableRanges.get()};
-    std::lock_guard lock(space->tableMutex);
-    const auto found = space->writeTables.find(writes);
-    if (found != space->writeTables.end()) {
-        writeTableSerial = found->second.first;
-        writeTableRanges = found->second.second;
-    } else {
-        writeTableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
-        writeTableSerial = Spaces().serials.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (space->writeTables.size() >= 64u) space->writeTables.erase(space->writeTables.begin());
-        space->writeTables.emplace(writes, std::pair{writeTableSerial, writeTableRanges});
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::coalescedWrites() const {
+    auto sortedWrites = writes;
+    std::sort(sortedWrites.begin(), sortedWrites.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
+    for (const auto& interval : sortedWrites) {
+        if (!intervals.empty() && interval.first <= intervals.back().second) intervals.back().second = std::max(intervals.back().second, interval.second);
+        else intervals.push_back(interval);
     }
+    return intervals;
+}
+
+std::optional<std::vector<std::uint64_t>> GuestBufferMemory::tableKey() const {
+    if (!space->rangesOrdered) return std::nullopt;
+    std::vector<ShaderRecompiler::BdaAbi::Range> own;
+    own.reserve(regions.size());
+    for (const auto& region : regions) {
+        own.push_back(addressRange(region));
+        if (own.size() > 1 && own.back().begin < own[own.size() - 2].begin) return std::nullopt;
+    }
+    std::vector<std::uint64_t> clips;
+    if (!writes.empty()) {
+        const auto intervals = coalescedWrites();
+        const auto clip = [&](std::uint64_t index, const ShaderRecompiler::BdaAbi::Range& range, const std::pair<std::uint64_t, std::uint64_t>& interval) {
+            if ((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u || interval.first >= range.end || range.begin >= interval.second) return;
+            for (const auto word : {index, std::max(range.begin, interval.first), std::min(range.end, interval.second)}) clips.push_back(word);
+        };
+        const auto& ranges = space->ranges;
+        for (const auto& interval : intervals) {
+            auto found = std::partition_point(ranges.begin(), ranges.end(), [&](const ShaderRecompiler::BdaAbi::Range& range) { return range.end <= interval.first; });
+            for (; found != ranges.end() && found->begin < interval.second; ++found) clip(static_cast<std::uint64_t>(found - ranges.begin()), *found, interval);
+        }
+        for (std::size_t index = 0; index < own.size(); ++index) {
+            for (const auto& interval : intervals) clip((1ull << 63u) | index, own[index], interval);
+        }
+    }
+    std::vector<std::uint64_t> key;
+    if (own.empty() && clips.empty()) return key;
+    key.reserve(1u + own.size() * 4u + clips.size());
+    key.push_back(own.size());
+    for (std::size_t index = 0; index < own.size(); ++index) {
+        const auto& region = regions[index];
+        const bool writableOwner = region.writable && (region.mirror == nullptr || region.mirror->writable);
+        for (const auto word : {own[index].begin, own[index].end, own[index].deviceAddress, static_cast<std::uint64_t>(own[index].permissions) | (writableOwner ? 1ull << 32u : 0ull)}) key.push_back(word);
+    }
+    key.insert(key.end(), clips.begin(), clips.end());
+    return key;
+}
+
+std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
+    if (space == nullptr) return std::nullopt;
+    Require(uploaded && !committed, "guest GPU address ranges are not available");
+    if (writeTableSerial != 0) return CachedTable{writeTableSerial, writeTableRanges != nullptr ? writeTableRanges.get() : &space->ranges};
+    auto& spaces = Spaces();
+    auto key = tableKey();
+    if (!key.has_value()) {
+        spaces.tablesUnkeyed.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    }
+    if (key->empty()) {
+        spaces.tablesOfSpace.fetch_add(1, std::memory_order_relaxed);
+        writeTableSerial = space->serial;
+        return CachedTable{writeTableSerial, &space->ranges};
+    }
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto word : *key) hash = (hash ^ word) * 0x100000001b3ull;
+    std::lock_guard lock(space->tableMutex);
+    auto& tables = space->keyedTables;
+    for (auto it = tables.begin(); it != tables.end(); ++it) {
+        if (it->hash != hash || it->key != *key) continue;
+        tables.splice(tables.begin(), tables, it);
+        spaces.tablesByKey.fetch_add(1, std::memory_order_relaxed);
+        writeTableSerial = it->serial;
+        writeTableRanges = it->ranges;
+        return CachedTable{writeTableSerial, writeTableRanges.get()};
+    }
+    writeTableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
+    writeTableSerial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
+    tables.push_front({hash, std::move(*key), writeTableSerial, writeTableRanges});
+    if (tables.size() > 64u) tables.pop_back();
+    spaces.tablesKeyed.fetch_add(1, std::memory_order_relaxed);
     return CachedTable{writeTableSerial, writeTableRanges.get()};
 }
 
