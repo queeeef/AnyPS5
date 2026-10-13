@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -120,14 +121,37 @@ std::uint64_t hashRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& ran
 
 }
 
+namespace {
+
+std::atomic<std::uint64_t> tableNanoseconds{0};
+std::atomic<std::uint64_t> faultNanoseconds{0};
+
+bool ConstructionProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+struct ConstructionTimer {
+    std::atomic<std::uint64_t>& into;
+    bool enabled = ConstructionProfiled();
+    std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ~ConstructionTimer() {
+        if (enabled) into.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+};
+
+}
+
 BdaResources::BdaResources(const Context& context) {
     static_assert(std::endian::native == std::endian::little);
+    const ConstructionTimer timer{faultNanoseconds};
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+    const ConstructionTimer timer{tableNanoseconds};
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
@@ -216,6 +240,8 @@ BdaResources::TableCacheStats BdaResources::TableCacheCounters() {
     stats.hits = cache.hits;
     stats.misses = cache.misses;
     stats.held = cache.entries.size();
+    stats.tableNanoseconds = tableNanoseconds.load(std::memory_order_relaxed);
+    stats.faultNanoseconds = faultNanoseconds.load(std::memory_order_relaxed);
     return stats;
 }
 
