@@ -2,6 +2,7 @@
 #include "Translation/TranslationContext.hpp"
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -40,13 +41,28 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         return bits;
     };
     const auto minMaxLane = [&](bool high) { return minMaxF16Bits(opcode == IrOpcode::FPMax32, laneBits(sourceAt(inst, 0u), high), laneBits(sourceAt(inst, 1u), high)); };
+    const RdnaOperand thirdOperand = accumulator ? accumulatorOperand(inst) : inst.sourceCount == 3u ? sourceAt(inst, 2u) : RdnaOperand{};
+    std::array<std::optional<IrU32>, 3> packedOperands{};
+    const auto packed = [&](std::uint32_t index) {
+        if (packedOperands[index].has_value()) return *packedOperands[index];
+        const RdnaOperand& operand = index == 2u ? thirdOperand : sourceAt(inst, index);
+        const IrU32 source = readF16SourceBits(operand);
+        IrValue* bits = &source.Value();
+        if (operand.opSel && operand.opSelHi) bits = &ir.BitwiseOr(ir.ShiftRightLogical(*bits, ir.Constant(16u)), ir.BitwiseAnd(*bits, ir.Constant(0xffff0000u)));
+        else if (!operand.opSel && !operand.opSelHi) bits = &ir.BitwiseOr(ir.BitwiseAnd(*bits, ir.Constant(0xffffu)), ir.ShiftLeftLogical(*bits, ir.Constant(16u)));
+        else if (operand.opSel && !operand.opSelHi) bits = &ir.BitwiseOr(ir.ShiftRightLogical(*bits, ir.Constant(16u)), ir.ShiftLeftLogical(*bits, ir.Constant(16u)));
+        if (operand.absolute) bits = &ir.BitwiseAnd(*bits, ir.Constant(0x7fff7fffu));
+        const std::uint32_t negate = (operand.negate ? 0x8000u : 0u) | (operand.negateHi ? 0x80000000u : 0u);
+        if (negate != 0u) bits = &ir.BitwiseXor(*bits, ir.Constant(negate));
+        packedOperands[index] = IrU32(*bits);
+        return IrU32(*bits);
+    };
     const bool native = nativeFloat16 && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32 || (nativeFloat16Fma && opcode == IrOpcode::FPFma32));
     const auto nativeResult = [&]() {
-        const auto packed = [&](const RdnaOperand& operand) { return packU16Lanes(laneBits(operand, false), laneBits(operand, true)); };
-        const IrU32 lhs = packed(sourceAt(inst, 0u));
-        const IrU32 rhs = packed(sourceAt(inst, 1u));
+        const IrU32 lhs = packed(0u);
+        const IrU32 rhs = packed(1u);
         if (opcode == IrOpcode::FPFma32) {
-            const IrU32 addend = packed(accumulator ? accumulatorOperand(inst) : sourceAt(inst, 2u));
+            const IrU32 addend = packed(2u);
             return IrU32(ir.Emit(IrOpcode::FPFma16x2, IrType::U32, {&lhs.Value(), &rhs.Value(), &addend.Value()}));
         }
         return IrU32(ir.Emit(opcode == IrOpcode::FPAdd32 ? IrOpcode::FPAdd16x2 : IrOpcode::FPMul16x2, IrType::U32, {&lhs.Value(), &rhs.Value()}));
@@ -54,17 +70,11 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
     IrU32 result = quietSnan ? packU16Lanes(minMaxLane(false), minMaxLane(true)) : native ? nativeResult() : packHalf2x16(translateLane(false), translateLane(true));
     const bool hasPackedF16Rules = !quietSnan && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32 || opcode == IrOpcode::FPFma32);
     if (hasPackedF16Rules && (native || !inst.destination.clamp || !dx10Clamp())) {
-        const auto packedBits = [&](const RdnaOperand& operand) {
-            return packU16Lanes(laneBits(operand, false), laneBits(operand, true));
-        };
         const std::uint32_t count = accumulator ? 3u : inst.sourceCount;
         IrU32 thirdBits(ir.Constant(0u));
-        if (count == 3u) {
-            const RdnaOperand& third = accumulator ? accumulatorOperand(inst) : sourceAt(inst, 2u);
-            thirdBits = packedBits(third);
-        }
-        const IrU32 firstBits = packedBits(sourceAt(inst, 0u));
-        const IrU32 secondBits = packedBits(sourceAt(inst, 1u));
+        if (count == 3u) thirdBits = packed(2u);
+        const IrU32 firstBits = packed(0u);
+        const IrU32 secondBits = packed(1u);
         const std::uint32_t flags = (count == 3u ? 1u : 0u)
             | (ieeeMode ? 2u : 0u)
             | (fp16Overflow() ? 4u : 0u)
@@ -78,9 +88,9 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
             &result.Value(),
             &ir.Constant(flags),
         }));
-        result = packU16Lanes(
-            inst.destination.clamp ? clampF16Bits(inst.destination, IrU32(ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu)))) : IrU32(ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu))),
-            inst.destination.clamp ? clampF16Bits(inst.destination, IrU32(ir.ShiftRightLogical(result.Value(), ir.Constant(16u)))) : IrU32(ir.ShiftRightLogical(result.Value(), ir.Constant(16u))));
+        if (inst.destination.clamp) {
+            result = packU16Lanes(clampF16Bits(inst.destination, IrU32(ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu)))), clampF16Bits(inst.destination, IrU32(ir.ShiftRightLogical(result.Value(), ir.Constant(16u)))));
+        }
     } else if (native || !inst.destination.clamp || !dx10Clamp() || quietSnan) {
         const auto isNan = [&](const IrU32& bits) {
             return IrU1(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));

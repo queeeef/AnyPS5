@@ -102,6 +102,9 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     if (denormals == 1u || denormals == 2u) {
         throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " is not implemented");
     }
+    static const bool nativeFlush = std::getenv("APS5_LOCAL_NATIVE_FTZ32") != nullptr;
+    static const bool skipFlush = std::getenv("APS5_LOCAL_SKIP_F32_FLUSH") != nullptr;
+    if (denormals == 0u && (skipFlush || (nativeFlush && nativeF32FlushToZero))) return 0u;
     return denormals == 0u ? flush : 0u;
 }
 

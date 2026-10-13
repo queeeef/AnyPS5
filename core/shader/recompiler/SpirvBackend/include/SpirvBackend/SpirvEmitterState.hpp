@@ -92,6 +92,7 @@ struct SpirvEmitterState {
     bool waveSpansSubgroups = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool f32FlushToZero = false;
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     std::unordered_set<const IrValue*> sharedLaneValues;

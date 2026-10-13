@@ -1054,6 +1054,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     VkPhysicalDeviceProperties2 floatProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &floatControls};
     state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &floatProperties);
     require(floatControls.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE, "shaderSignedZeroInfNanPreserveFloat32 is unavailable");
+    std::fprintf(stderr, "[local-ftz] shaderDenormFlushToZeroFloat32=%u shaderDenormPreserveFloat32=%u denormBehaviorIndependence=%d\n", floatControls.shaderDenormFlushToZeroFloat32, floatControls.shaderDenormPreserveFloat32, static_cast<int>(floatControls.denormBehaviorIndependence));
+    if (std::getenv("APS5_LOCAL_NATIVE_FTZ32") != nullptr && floatControls.shaderDenormFlushToZeroFloat32 == VK_TRUE && floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL) state->capabilities.push_back(spv::CapabilityDenormFlushToZero);
     const std::array<const char*, 2> meshExtensions{VK_EXT_MESH_SHADER_EXTENSION_NAME, VK_KHR_SPIRV_1_4_EXTENSION_NAME};
     const bool meshAvailable = std::all_of(meshExtensions.begin(), meshExtensions.end(), hasExtension);
     VkPhysicalDeviceMeshShaderFeaturesEXT meshFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};

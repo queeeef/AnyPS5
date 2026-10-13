@@ -193,6 +193,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.nativeFloat16Fma = translateOptions.nativeFloat16 && supports(SpirvCapabilityFmaKHR);
     translateOptions.floatMode = request.context.floatMode;
+    translateOptions.nativeF32FlushToZero = supports(spv::CapabilityDenormFlushToZero);
     translateOptions.inputInfo = inputInfo;
 
     constexpr InstructionTranslator translator;
@@ -446,6 +447,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
+    targetOptions.f32FlushToZero = std::getenv("APS5_LOCAL_NATIVE_FTZ32") != nullptr && request.context.floatMode.has_value() && ((request.context.floatMode->floatMode >> 4u) & 3u) == 0u && std::find(request.target.supportedCapabilities.begin(), request.target.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormFlushToZero)) != request.target.supportedCapabilities.end();
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
 
