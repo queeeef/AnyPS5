@@ -115,6 +115,7 @@ struct GuestBufferMemory::AddressSpace {
         std::vector<std::uint64_t> key;
         std::uint64_t serial;
         std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ranges;
+        std::shared_ptr<Buffer> table;
     };
     mutable std::mutex tableMutex;
     mutable std::list<KeyedTable> keyedTables;
@@ -3653,17 +3654,39 @@ std::optional<std::vector<std::uint64_t>> GuestBufferMemory::tableKey() const {
     return key;
 }
 
-std::shared_ptr<Buffer> GuestBufferMemory::SpaceTable(std::uint64_t serial) const {
-    if (space == nullptr || space->serial != serial) return nullptr;
-    std::lock_guard lock(space->tableMutex);
-    return space->table;
+namespace {
+
+constexpr std::size_t HeldKeyedTables = 8;
+
 }
 
-void GuestBufferMemory::KeepSpaceTable(std::uint64_t serial, const std::shared_ptr<Buffer>& table) const {
-    Require(table != nullptr, "no BDA table to keep");
-    if (space == nullptr || space->serial != serial) return;
+std::shared_ptr<Buffer> GuestBufferMemory::HeldTable(std::uint64_t serial) const {
+    if (space == nullptr || serial == 0) return nullptr;
     std::lock_guard lock(space->tableMutex);
-    if (space->table == nullptr) space->table = table;
+    if (serial == space->serial) return space->table;
+    std::size_t index = 0;
+    for (const auto& entry : space->keyedTables) {
+        if (index++ == HeldKeyedTables) break;
+        if (entry.serial == serial) return entry.table;
+    }
+    return nullptr;
+}
+
+void GuestBufferMemory::KeepTable(std::uint64_t serial, const std::shared_ptr<Buffer>& table) const {
+    Require(table != nullptr, "no BDA table to keep");
+    if (space == nullptr || serial == 0) return;
+    std::lock_guard lock(space->tableMutex);
+    if (serial == space->serial) {
+        if (space->table == nullptr) space->table = table;
+        return;
+    }
+    std::size_t index = 0;
+    for (auto& entry : space->keyedTables) {
+        if (index++ == HeldKeyedTables) break;
+        if (entry.serial != serial) continue;
+        if (entry.table == nullptr) entry.table = table;
+        return;
+    }
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
@@ -3683,11 +3706,17 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     }
     std::uint64_t hash = 0xcbf29ce484222325ull;
     for (const auto word : *key) hash = (hash ^ word) * 0x100000001b3ull;
+    std::shared_ptr<Buffer> released;
     std::lock_guard lock(space->tableMutex);
     auto& tables = space->keyedTables;
+    const auto release = [&] {
+        if (tables.size() <= HeldKeyedTables) return;
+        released = std::move(std::next(tables.begin(), static_cast<std::ptrdiff_t>(HeldKeyedTables))->table);
+    };
     for (auto it = tables.begin(); it != tables.end(); ++it) {
         if (it->hash != hash || it->key != *key) continue;
         tables.splice(tables.begin(), tables, it);
+        release();
         spaces.tablesByKey.fetch_add(1, std::memory_order_relaxed);
         writeTableSerial = it->serial;
         writeTableRanges = it->ranges;
@@ -3695,7 +3724,8 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     }
     writeTableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
     writeTableSerial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
-    tables.push_front({hash, std::move(*key), writeTableSerial, writeTableRanges});
+    tables.push_front({hash, std::move(*key), writeTableSerial, writeTableRanges, nullptr});
+    release();
     if (tables.size() > 64u) tables.pop_back();
     spaces.tablesKeyed.fetch_add(1, std::memory_order_relaxed);
     return CachedTable{writeTableSerial, writeTableRanges.get()};
