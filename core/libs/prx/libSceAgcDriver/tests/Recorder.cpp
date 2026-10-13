@@ -575,6 +575,34 @@ void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(Recorder::ReadCounts().hits[static_cast<std::size_t>(Kind::AddressBased)] >= 2, "address-based hits are not counted");
     recorder.Sync();
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x20000, 0x1000, false), "noted ranges outlived their batch");
+    using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    const auto space = std::make_shared<const Ranges>(Ranges{{0x60000, 0x61000}, {0x62000, 0x62100}, {0x70000, 0x80000}});
+    const auto respace = std::make_shared<const Ranges>(Ranges{{0x90000, 0x91000}});
+    const auto before = Recorder::ReadCounts();
+    recorder.NotePendingReadSet(space, Kind::AddressBased);
+    recorder.NotePendingReadSet(space, Kind::AddressBased);
+    recorder.NotePendingReadSet(respace, Kind::AddressBased);
+    const auto sets = Recorder::ReadCounts();
+    Require(sets.setsNoted == before.setsNoted + 2 && sets.setsShared == before.setsShared + 1 && sets.noted == before.noted + 4, "a repeated read set was noted twice");
+    Require(recorder.PendingReadOverlaps(0x60000, 1) && recorder.PendingReadOverlaps(0x60fff, 1) && recorder.PendingReadOverlaps(0x61f00, 0x200) && recorder.PendingReadOverlaps(0x6ffff, 2) && recorder.PendingReadOverlaps(0x7fffc, 4) && recorder.PendingReadOverlaps(0x90800, 4), "a shared read set's range is not seen");
+    Require(!recorder.PendingReadOverlaps(0x5ffff, 1) && !recorder.PendingReadOverlaps(0x61000, 0x1000) && !recorder.PendingReadOverlaps(0x62100, 0x100) && !recorder.PendingReadOverlaps(0x80000, 0x10000) && !recorder.PendingReadOverlaps(0x91000, 4), "a gap between shared ranges is reported as read");
+    const auto shared = recorder.DescribePendingRead(0x70010, 4);
+    Require(shared.has_value() && shared->kind == Kind::AddressBased && shared->open, "a shared read set has the wrong reader kind");
+    recorder.Submit();
+    Require(recorder.PendingReadOverlaps(0x62000, 4, false) && recorder.PendingReadOverlaps(0x90000, 4, false), "the raw scan does not see the in-flight batch's shared reads");
+    recorder.Sync();
+    Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x62000, 4, false), "a shared read set outlived its batch");
+    recorder.NotePendingReadSet(space, Kind::AddressBased);
+    Require(Recorder::ReadCounts().setsNoted == sets.setsNoted + 1, "a read set was not noted again in a new batch");
+    recorder.Sync();
+    bool refused = false;
+    try {
+        recorder.NotePendingReadSet(std::make_shared<const Ranges>(Ranges{{0x30000, 0x31000}, {0x30800, 0x32000}}), Kind::AddressBased);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    Require(refused, "an overlapping read set was accepted");
+    recorder.Sync();
 }
 
 void writeSettledTests(const Device& device, Recorder& recorder) {

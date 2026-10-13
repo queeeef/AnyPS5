@@ -3437,6 +3437,8 @@ struct DispatchCounters {
     std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0;
     double templateRevalidateMs = 0;
     std::uint64_t procLookups = 0, preBarriersRecorded = 0, preBarriersSkipped = 0;
+    std::array<std::array<double, DispatchPhaseCount>, 2> classTotals{};
+    std::array<std::uint64_t, 2> classCalls{};
     std::chrono::steady_clock::time_point cacheReport = std::chrono::steady_clock::now();
 };
 
@@ -3517,6 +3519,7 @@ struct DispatchTimer {
     bool indirect;
     std::size_t spirvWords;
     std::uint64_t programAddress;
+    bool addressBased = false;
     std::array<double, DispatchRows> callMs{};
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point phaseStart;
@@ -3559,6 +3562,18 @@ struct DispatchTimer {
             if (d.phaseTotals[row] != 0) report += " " + std::string(DispatchRowName(row)) + "=" + std::to_string(static_cast<long long>(d.phaseTotals[row] / 1000)) + "s";
         }
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %llu dispatches, phase totals:%s\n", static_cast<unsigned long long>(d.profiledDispatches), report.c_str());
+        std::string split;
+        for (std::size_t kind = 2; kind-- > 0;) {
+            split += kind == 1 ? " address-based " : "; other ";
+            split += std::to_string(static_cast<unsigned long long>(d.classCalls[kind])) + " calls:";
+            for (std::size_t row = 0; row < DispatchPhaseCount; ++row) {
+                if (d.classTotals[kind][row] < 0.5) continue;
+                char text[96];
+                std::snprintf(text, sizeof(text), " %s=%.0fms", DispatchRowName(row), d.classTotals[kind][row]);
+                split += text;
+            }
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %llu dispatches, phase totals by build kind (cumulative):%s\n", static_cast<unsigned long long>(d.profiledDispatches), split.c_str());
     }
     // The call's end: the proc lookups it made, the slow-call report, the [indirect] hold
     // accounting (`indirectHold`: the call was an indirect dispatch, CPU-resolved or not) and line.
@@ -3566,6 +3581,9 @@ struct DispatchTimer {
         if (!profile) return;
         auto& d = Dispatches();
         d.procLookups += Graphics::DeviceProcLookups() - lookupsBefore;
+        const auto kind = addressBased ? 1u : 0u;
+        ++d.classCalls[kind];
+        for (std::size_t row = 0; row < DispatchPhaseCount; ++row) d.classTotals[kind][row] += callMs[row];
         const auto now = std::chrono::steady_clock::now();
         const auto totalMs = std::chrono::duration<double, std::milli>(now - start).count();
         if (totalMs > 100) AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %s %zu words:%s\n", groupsText, spirvWords, formatCall().c_str());
@@ -4203,6 +4221,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         }
     }
     resources->PatchPushConstants(pushBytes);
+    timer.addressBased = resources->UsesAddressTable();
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for
     // the longest call.

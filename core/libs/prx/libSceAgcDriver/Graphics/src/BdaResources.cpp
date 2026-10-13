@@ -146,6 +146,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
+        if (!cached.has_value()) ++cache.classes.mergedTables;
         if (serial != 0) {
             for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
                 if (it->spaceSerial != serial) continue;

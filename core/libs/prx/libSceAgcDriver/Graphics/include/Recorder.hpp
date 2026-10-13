@@ -135,6 +135,7 @@ public:
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
+    void NotePendingReadSet(std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges, ReadKind kind);
     // Whether an unexecuted batch (open, or in flight with its fence unsignaled) reads the range in
     // place. A hit in an in-flight batch whose fence signaled meanwhile is a miss (one status
     // query per hit). `ignoreSignaled` false: every in-flight batch counts, whatever its fence.
@@ -154,6 +155,7 @@ public:
     // queries, hits by reader kind, and hits ignored because the reader's fence had signaled.
     struct ReadStatistics {
         std::uint64_t noted, queries, staleIgnored;
+        std::uint64_t setsNoted, setsShared;
         std::array<std::uint64_t, static_cast<std::size_t>(ReadKind::Count)> hits;
     };
     static ReadStatistics ReadCounts();
@@ -533,6 +535,11 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        struct ReadSet {
+            std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges;
+            ReadKind kind;
+        };
+        std::vector<ReadSet> readSets;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         bool submitted = false;
@@ -737,8 +744,7 @@ private:
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
-    // The first noted read of `batch` overlapping [address, end), or null.
-    static const Batch::Read* readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end);
+    static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end);
     bool signaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
     void publishPendingWrites() const;

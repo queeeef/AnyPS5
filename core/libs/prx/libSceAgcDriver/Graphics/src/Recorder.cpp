@@ -570,7 +570,25 @@ std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, qu
 // Read-tracking counters (Recorder::ReadCounts), relaxed: they are only reported.
 constexpr std::size_t ReadKinds = static_cast<std::size_t>(Recorder::ReadKind::Count);
 std::atomic<std::uint64_t> readsNoted{0}, readQueries{0}, readStaleIgnored{0};
+std::atomic<std::uint64_t> readSetsNoted{0}, readSetsShared{0};
 std::atomic<std::uint64_t> readHits[ReadKinds]{};
+
+namespace {
+
+bool RangeSetOverlaps(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t address, std::uint64_t end) {
+    const auto found = std::partition_point(ranges.begin(), ranges.end(), [address](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.second <= address; });
+    return found != ranges.end() && found->first < end;
+}
+
+template<typename TBatch, typename TVisitor>
+void ForEachRead(const TBatch& batch, const TVisitor& visit) {
+    for (const auto& read : batch.reads) visit(read.begin, read.end);
+    for (const auto& set : batch.readSets) {
+        for (const auto& [begin, end] : *set.ranges) visit(begin, end);
+    }
+}
+
+}
 
 bool ReadTrackingEnabled() {
     // APS5_COPY_READ_TRACKING=0: no in-place reads are noted; the copy HLE's CPU path then requires
@@ -2814,11 +2832,35 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
 }
 
-const Recorder::Batch::Read* Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
-    for (const auto& read : batch.reads) {
-        if (address < read.end && read.begin < end) return &read;
+void Recorder::NotePendingReadSet(std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges, ReadKind kind) {
+    Require(ranges != nullptr, "missing shared read set");
+    if (ranges->empty() || !ReadTrackingEnabled()) return;
+    ensureOpen();
+    for (const auto& set : open->readSets) {
+        if (set.ranges == ranges && set.kind == kind) {
+            readSetsShared.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
     }
-    return nullptr;
+    std::uint64_t previousEnd = 0;
+    for (const auto& [begin, end] : *ranges) {
+        Require(begin < end && begin >= previousEnd, "a shared read set is not sorted and disjoint");
+        previousEnd = end;
+        CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
+    }
+    open->readSets.push_back({std::move(ranges), kind});
+    readsNoted.fetch_add(open->readSets.back().ranges->size(), std::memory_order_relaxed);
+    readSetsNoted.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::optional<Recorder::ReadKind> Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
+    for (const auto& read : batch.reads) {
+        if (address < read.end && read.begin < end) return read.kind;
+    }
+    for (const auto& set : batch.readSets) {
+        if (RangeSetOverlaps(*set.ranges, address, end)) return set.kind;
+    }
+    return std::nullopt;
 }
 
 bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, bool ignoreSignaled) const {
@@ -2826,20 +2868,20 @@ bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, boo
     readQueries.fetch_add(1, std::memory_order_relaxed);
     const auto end = address + bytes;
     if (open != nullptr) {
-        if (const auto* read = readOverlap(*open, address, end)) {
-            readHits[static_cast<std::size_t>(read->kind)].fetch_add(1, std::memory_order_relaxed);
+        if (const auto kind = readOverlap(*open, address, end)) {
+            readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     }
     // Newest first: the batch most likely still running decides without a status query per batch.
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
-        const auto* read = readOverlap(**it, address, end);
-        if (read == nullptr) continue;
+        const auto kind = readOverlap(**it, address, end);
+        if (!kind.has_value()) continue;
         if (ignoreSignaled && signaled(**it)) {
             readStaleIgnored.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        readHits[static_cast<std::size_t>(read->kind)].fetch_add(1, std::memory_order_relaxed);
+        readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     return false;
@@ -2849,16 +2891,16 @@ std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint
     if (bytes == 0) return std::nullopt;
     const auto end = address + bytes;
     if (open != nullptr) {
-        if (const auto* read = readOverlap(*open, address, end)) return PendingReadInfo{submissions + 1, open->queue, read->kind, true, false};
+        if (const auto kind = readOverlap(*open, address, end)) return PendingReadInfo{submissions + 1, open->queue, *kind, true, false};
     }
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
-        if (const auto* read = readOverlap(**it, address, end)) return PendingReadInfo{(*it)->serial, (*it)->queue, read->kind, false, signaled(**it)};
+        if (const auto kind = readOverlap(**it, address, end)) return PendingReadInfo{(*it)->serial, (*it)->queue, *kind, false, signaled(**it)};
     }
     return std::nullopt;
 }
 
 Recorder::ReadStatistics Recorder::ReadCounts() {
-    ReadStatistics counts{readsNoted.load(std::memory_order_relaxed), readQueries.load(std::memory_order_relaxed), readStaleIgnored.load(std::memory_order_relaxed), {}};
+    ReadStatistics counts{readsNoted.load(std::memory_order_relaxed), readQueries.load(std::memory_order_relaxed), readStaleIgnored.load(std::memory_order_relaxed), readSetsNoted.load(std::memory_order_relaxed), readSetsShared.load(std::memory_order_relaxed), {}};
     for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].load(std::memory_order_relaxed);
     return counts;
 }
@@ -3160,7 +3202,7 @@ void Recorder::Submit() {
     if (FlipReadCheck()) {
         // A CPU write into a noted read after this collect (and so possibly before the GPU read
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
-        for (const auto& read : open->reads) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(read.begin, read.end - read.begin));
+        ForEachRead(*open, [&](std::uint64_t begin, std::uint64_t end) { open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin)); });
     }
     auto batch = std::move(open);
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
@@ -3169,7 +3211,7 @@ void Recorder::Submit() {
     submission.pCommandBuffers = &batch->commands;
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
-    CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size(), batch->writes.size());
+    CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size() + batch->readSets.size(), batch->writes.size());
     VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
     timelineInfo.signalSemaphoreValueCount = 1;
     timelineInfo.pSignalSemaphoreValues = &serial;
@@ -3626,7 +3668,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
                     const auto reads = Recorder::ReadCounts();
-                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu, draw input %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.hits[6]), static_cast<unsigned long long>(reads.staleIgnored));
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted (%llu address-space sets, %llu repeat uses of a set already in its batch), %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu, draw input %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.setsNoted), static_cast<unsigned long long>(reads.setsShared), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.hits[6]), static_cast<unsigned long long>(reads.staleIgnored));
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
@@ -3659,7 +3701,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         entry.readGeneration = batch->readGeneration;
         entry.reads.clear();
         if (FlipReadCheck()) {
-            for (const auto& read : batch->reads) entry.reads.emplace_back(read.begin, read.end);
+            ForEachRead(*batch, [&](std::uint64_t begin, std::uint64_t end) { entry.reads.emplace_back(begin, end); });
         }
     }
     // Completions store GPU results to guest memory; a failing one is reported, the rest still run.
