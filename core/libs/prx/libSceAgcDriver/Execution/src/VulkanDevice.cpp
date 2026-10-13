@@ -3223,46 +3223,6 @@ ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, Vk
     return key;
 }
 
-bool MovedDispatchTemplates() {
-    static const bool enabled = std::getenv("APS5_LOCAL_DISPATCH_MOVED") != nullptr;
-    return enabled;
-}
-
-ResourceCache::Key MovableDispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device) {
-    ResourceCache::Key key{0xfffffffeu};
-    const auto part = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), true);
-    key.insert(key.end(), part.begin(), part.end());
-    const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
-    key.push_back(static_cast<std::uint32_t>(deviceHandle));
-    key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
-    return key;
-}
-
-struct MovedDispatchCounters {
-    std::atomic<std::uint64_t> exactHits{0};
-    std::atomic<std::uint64_t> movedHits{0};
-    std::atomic<std::uint64_t> movedRefused{0};
-    std::atomic<std::uint64_t> builds{0};
-    std::atomic<std::uint64_t> buffersMoved{0};
-    std::atomic<std::uint64_t> bdaBuilds{0};
-    std::atomic<std::uint64_t> unreusableBuilds{0};
-};
-
-MovedDispatchCounters& MovedCounters() {
-    static MovedDispatchCounters counters;
-    return counters;
-}
-
-void ReportMovedDispatch() {
-    static std::mutex reportMutex;
-    static auto window = std::chrono::steady_clock::now();
-    std::lock_guard lock(reportMutex);
-    if (std::chrono::steady_clock::now() - window < std::chrono::seconds(10)) return;
-    window = std::chrono::steady_clock::now();
-    auto& counters = MovedCounters();
-    std::fprintf(stderr, "[local-moved-dispatch] 10 s: exact template hits %llu, moved-buffer template hits %llu (%llu buffers rebound), movable candidates refused %llu, builds %llu (address-based %llu, not reusable %llu)\n", static_cast<unsigned long long>(counters.exactHits.exchange(0)), static_cast<unsigned long long>(counters.movedHits.exchange(0)), static_cast<unsigned long long>(counters.buffersMoved.exchange(0)), static_cast<unsigned long long>(counters.movedRefused.exchange(0)), static_cast<unsigned long long>(counters.builds.exchange(0)), static_cast<unsigned long long>(counters.bdaBuilds.exchange(0)), static_cast<unsigned long long>(counters.unreusableBuilds.exchange(0)));
-}
-
 // The phases of VulkanDevice::dispatch (APS5_PROFILE_DRAW), followed by one row per image lookup
 // outcome (Graphics::LookupOutcomes) on the [indirect] line.
 enum DispatchPhase : std::size_t { PhaseReap, PhaseResources, PhaseResourcesInsert, PhaseResourcesComplete, PhaseResourcesImages, PhaseResourcesUpload, PhaseResourcesDescriptors, PhaseResourcesOther, PhaseResourcesALocked, PhaseResourcesAddress, PhaseResourcesAUnlocked, PhaseResourcesRevalidate, PhaseResourcesFullBuild, PhaseResourcesHookWaits, PhaseProof, PhasePipeline, PhaseDecide, PhaseArgumentRead, PhaseRecordCommands, PhaseRecordKeeps, PhaseRecordDataRefresh, PhaseRecordBind, PhaseRecordMarks, PhaseRecordCompletion, PhaseRecord, PhaseSync, DispatchPhaseCount };
@@ -3286,7 +3246,6 @@ struct PreparedDispatch {
     // cache held the key's object at prepare time: the dispatch revalidates `cached` instead.
     std::shared_ptr<Graphics::ShaderResources> resources;
     std::shared_ptr<Graphics::ShaderResources> cached;
-    std::shared_ptr<Graphics::ShaderResources> movableCandidate;
     ResourceCache::Key key;
     // APS5_PROFILE_DRAW: stage A's time, added to the [dispatch] phase totals by the dispatch, and
     // the prepare's parts for the driver's 'prepare:' rows (PreparePhase order).
@@ -3651,7 +3610,6 @@ struct RecordedDispatch {
     // Whether the data refresh recorded anything.
     bool refreshed = false;
     bool resourceKeyMatched = false;
-    std::vector<Graphics::ShaderResources::MovedBuffer> moved;
 };
 
 VkDevice VulkanDevice::Device() const {
@@ -3781,10 +3739,9 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         phase(PreparedDispatch::PrepareKey);
         cached = state->resourceCache.Find(prepared->key);
         prepared->cached = cached;
-        if (cached == nullptr && MovedDispatchTemplates()) prepared->movableCandidate = state->resourceCache.Find(MovableDispatchContentKey(compute, context.device));
         phase(PreparedDispatch::PrepareFind);
     }
-    if (cached == nullptr && prepared->movableCandidate == nullptr) {
+    if (cached == nullptr) {
         prepared->resources = std::make_shared<Graphics::ShaderResources>(context, compute, snapshots, true, dispatchThreads);
         phase(PreparedDispatch::PrepareStageA);
     }
@@ -3804,7 +3761,7 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     // semaphores.
     if (!NoPresync() && CanWaitUnlocked()) {
         Presyncs().checked.fetch_add(1, std::memory_order_relaxed);
-        const auto surfaces = cached != nullptr ? cached->PresyncSurfaces() : prepared->resources != nullptr ? prepared->resources->PresyncSurfaces() : prepared->movableCandidate->PresyncSurfaces();
+        const auto surfaces = cached != nullptr ? cached->PresyncSurfaces() : prepared->resources->PresyncSurfaces();
         prepared->presyncSerial = presync(surfaces);
         phase(PreparedDispatch::PreparePresync);
     }
@@ -4015,14 +3972,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         ++d.preBarriersRecorded;
     }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
-    if (!record.moved.empty()) {
-        auto movedBindings = resources.PrepareDrawBindings(recorder, record.moved);
-        Graphics::Require(movedBindings != nullptr && movedBindings->allocation.set != VK_NULL_HANDLE, "a dispatch with moved buffers has no descriptor set of its own");
-        context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &movedBindings->allocation.set, 0, nullptr);
-        recorder.Keep(std::move(movedBindings));
-    } else {
-        resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
-    }
+    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
         auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
@@ -4203,17 +4153,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             ++d.cacheMisses;
             if (resources->Reusable()) insert();
         }
-        if (MovedDispatchTemplates()) {
-            auto& counters = MovedCounters();
-            counters.builds.fetch_add(1, std::memory_order_relaxed);
-            if (resources->UsesAddressTable()) counters.bdaBuilds.fetch_add(1, std::memory_order_relaxed);
-            else if (!resources->Reusable()) counters.unreusableBuilds.fetch_add(1, std::memory_order_relaxed);
-            if (cacheable && resources->Reusable() && !resources->UsesAddressTable()) {
-                std::vector<std::shared_ptr<Graphics::ShaderResources>> evicted;
-                state->resourceCache.Insert(MovableDispatchContentKey(shaders[0], context.device), resources, &evicted);
-                for (auto& object : evicted) state->recorder->Keep(std::move(object));
-            }
-        }
     } else if (cacheable) {
         // PrepareDispatch made the key already when it found the cached object, and carries the
         // object it found: revalidated as a map hit would be (an entry replaced meanwhile is left
@@ -4238,47 +4177,15 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             }
         }
     }
-    std::vector<Graphics::ShaderResources::MovedBuffer> movedBuffers;
-    ResourceCache::Key movableKey;
-    if (cacheable && MovedDispatchTemplates()) {
-        if (resources != nullptr && fromCache) MovedCounters().exactHits.fetch_add(1, std::memory_order_relaxed);
-        movableKey = MovableDispatchContentKey(shaders[0], context.device);
-        if (resources == nullptr) {
-            auto candidate = prepared != nullptr && prepared->movableCandidate != nullptr ? std::move(prepared->movableCandidate) : state->resourceCache.Find(movableKey);
-            if (candidate != nullptr) {
-                std::optional<std::vector<Graphics::ShaderResources::MovedBuffer>> found;
-                if (!candidate->UsesAddressTable() && candidate->Reusable() && candidate->Revalidate(shaders[0])) found = candidate->MovedReadOnlyBuffers(shaders, *state->recorder);
-                if (found.has_value()) {
-                    for (auto& entry : *found) {
-                        if (entry.words.empty()) movedBuffers.push_back(std::move(entry));
-                    }
-                    MovedCounters().movedHits.fetch_add(1, std::memory_order_relaxed);
-                    MovedCounters().buffersMoved.fetch_add(movedBuffers.size(), std::memory_order_relaxed);
-                    resources = std::move(candidate);
-                    fromCache = true;
-                    ++d.cacheHits;
-                } else {
-                    MovedCounters().movedRefused.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        }
-    }
     if (resources == nullptr) {
-        if (MovedDispatchTemplates()) MovedCounters().builds.fetch_add(1, std::memory_order_relaxed);
         const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
         if (profile) timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
         if (cacheable) {
             ++d.cacheMisses;
             if (resources->Reusable()) insert();
-            if (resources->Reusable() && !movableKey.empty() && !resources->UsesAddressTable()) {
-                std::vector<std::shared_ptr<Graphics::ShaderResources>> evicted;
-                state->resourceCache.Insert(movableKey, resources, &evicted);
-                for (auto& object : evicted) state->recorder->Keep(std::move(object));
-            }
         }
     }
-    if (MovedDispatchTemplates()) ReportMovedDispatch();
     resources->PatchPushConstants(pushBytes);
     timer.addressBased = resources->UsesAddressTable();
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
@@ -4378,7 +4285,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     auto& recorder = *state->recorder;
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer};
-    record.moved = movedBuffers;
     record.resourceKeyMatched = fromCache;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
@@ -4433,7 +4339,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
     // Revalidate and nothing needs completion work.
-    if (recipeOut != nullptr && DispatchRecipes() && cacheable && movedBuffers.empty() && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
+    if (recipeOut != nullptr && DispatchRecipes() && cacheable && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
         recipe->templateRef = resources;
