@@ -4212,6 +4212,13 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         const VkPipelineCreateFlags pipelineFlags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
         const Graphics::PipelineSpecialization specialization(shader);
         const auto subgroupSize = state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize) : 0u;
+        if (const char* spvDirectory = std::getenv("APS5_LOCAL_DUMP_SPV"); spvDirectory != nullptr && shader.spirv.size() > 15000u) {
+            const std::string name = std::string(spvDirectory) + "/cs_" + std::to_string(shader.spirv.size()) + ".spv";
+            if (std::FILE* file = std::fopen(name.c_str(), "wb")) {
+                std::fwrite(shader.spirv.data(), sizeof(shader.spirv[0]), shader.spirv.size(), file);
+                std::fclose(file);
+            }
+        }
         if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); directory != nullptr && *directory != '\0' && CaptureComputePipeline(shader.spirv.size())) {
             ComputePipelineCapture capture;
             capture.spirv = shader.spirv;
