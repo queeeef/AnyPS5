@@ -56,6 +56,7 @@
 #include <deque>
 #include <limits>
 #include <list>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -3228,6 +3229,53 @@ bool MovedDispatchTemplates() {
     return enabled;
 }
 
+struct MovableKeyProbe {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> seen;
+    std::deque<std::uint64_t> order;
+    std::unordered_map<std::uint64_t, std::vector<ShaderRecompiler::DescriptorBinding>> lastBindings;
+    std::array<std::array<std::uint64_t, 6>, 2> counts{};
+    std::array<std::map<std::string, std::uint64_t>, 2> differences;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+MovableKeyProbe& MovableProbe() {
+    static MovableKeyProbe probe;
+    return probe;
+}
+
+std::string MovableDifference(const std::vector<ShaderRecompiler::DescriptorBinding>& previous, const std::vector<ShaderRecompiler::DescriptorBinding>& current) {
+    using Role = ShaderRecompiler::DescriptorRole;
+    if (previous.size() != current.size()) return "binding layout";
+    for (std::size_t index = 0; index < current.size(); ++index) {
+        const auto& before = previous[index];
+        const auto& now = current[index];
+        if (before.kind != now.kind || before.role != now.role || before.count != now.count || before.guestDescriptor.size() != now.guestDescriptor.size() || before.bufferWritten != now.bufferWritten) return "binding layout";
+        if (now.role == Role::ShaderData || now.role == Role::FlattenedSrt) continue;
+        if (now.role == Role::GuestBuffers && now.guestDescriptor.size() == static_cast<std::size_t>(now.count) * 4u) {
+            for (std::uint32_t element = 0; element < now.count; ++element) {
+                const auto* a = before.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+                const auto* b = now.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+                const bool written = element >= now.bufferWritten.size() || now.bufferWritten[element];
+                const bool empty = b[2] == 0 || (b[0] == 0 && (b[1] & 0xffffu) == 0) || a[2] == 0 || (a[0] == 0 && (a[1] & 0xffffu) == 0);
+                if (written || empty) {
+                    if (a[0] != b[0] || (a[1] & 0xffffu) != (b[1] & 0xffffu)) return empty ? "null/non-null V#" : "written V# address";
+                    if (a[2] != b[2]) return "written V# size";
+                    if (a[1] != b[1] || a[3] != b[3]) return "written V# format/stride";
+                } else if ((a[1] & 0xffff0000u) != (b[1] & 0xffff0000u) || a[3] != b[3]) {
+                    return "read-only V# format/stride";
+                }
+            }
+            continue;
+        }
+        if (before.guestDescriptor != now.guestDescriptor) return now.role == Role::GuestImages ? "T# words" : now.role == Role::GuestSamplers ? "S# words" : now.role == Role::Gds ? "GDS" : "other descriptor words";
+        if (before.imageSamplers != now.imageSamplers || before.imageWritten != now.imageWritten || before.samplerDepthCompare != now.samplerDepthCompare || before.imageDepthCompare != now.imageDepthCompare || before.imageUnnormalized != now.imageUnnormalized || before.samplerUnnormalized != now.samplerUnnormalized || before.samplerIntegerBorder != now.samplerIntegerBorder || before.imageUnnormalizedBaseLevel != now.imageUnnormalizedBaseLevel || before.imageAtomic != now.imageAtomic) return "image modes";
+    }
+    return "same bindings";
+}
+
+void ProbeMovableKey(const Graphics::CompiledShader& shader, VkDevice device, bool addressBased, std::uint64_t space, bool templateHit);
+
 ResourceCache::Key MovableDispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device) {
     ResourceCache::Key key{0xfffffffeu};
     const auto part = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), true);
@@ -3236,6 +3284,52 @@ ResourceCache::Key MovableDispatchContentKey(const Graphics::CompiledShader& sha
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
     return key;
+}
+
+void ProbeMovableKey(const Graphics::CompiledShader& shader, VkDevice device, bool addressBased, std::uint64_t space, bool templateHit) {
+    const auto key = MovableDispatchContentKey(shader, device);
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto word : key) hash = (hash ^ word) * 0x100000001b3ull;
+    auto& probe = MovableProbe();
+    std::lock_guard lock(probe.mutex);
+    const auto kind = addressBased ? 1u : 0u;
+    auto& counts = probe.counts[kind];
+    ++counts[0];
+    if (templateHit) ++counts[1];
+    else if (const auto found = probe.seen.find(hash); found != probe.seen.end()) {
+        ++counts[2];
+        if (found->second == space) ++counts[3];
+    } else {
+        const auto variant = shader.program->PipelineVariantId();
+        auto last = probe.lastBindings.find(variant);
+        if (last == probe.lastBindings.end()) ++counts[4];
+        else {
+            ++counts[5];
+            ++probe.differences[kind][MovableDifference(last->second, shader.program->bindings)];
+        }
+    }
+    if (const auto [entry, inserted] = probe.seen.insert_or_assign(hash, space); inserted) {
+        probe.order.push_back(hash);
+        if (probe.order.size() > 16384) {
+            probe.seen.erase(probe.order.front());
+            probe.order.pop_front();
+        }
+    }
+    probe.lastBindings[shader.program->PipelineVariantId()] = shader.program->bindings;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - probe.lastReport < std::chrono::seconds(10)) return;
+    probe.lastReport = now;
+    std::string line = "[local-movable-probe] 10 s:";
+    for (std::size_t which = 2; which-- > 0;) {
+        const auto& c = probe.counts[which];
+        char text[320];
+        std::snprintf(text, sizeof(text), "%s %llu builds: template hits %llu, movable key seen before %llu (same address space %llu), first of their variant %llu, differing from the variant's last bindings %llu by:", which == 1 ? " address-based" : "; other", static_cast<unsigned long long>(c[0]), static_cast<unsigned long long>(c[1]), static_cast<unsigned long long>(c[2]), static_cast<unsigned long long>(c[3]), static_cast<unsigned long long>(c[4]), static_cast<unsigned long long>(c[5]));
+        line += text;
+        for (const auto& [name, count] : probe.differences[which]) line += " " + name + " " + std::to_string(count);
+        probe.counts[which] = {};
+        probe.differences[which].clear();
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
 }
 
 struct MovedDispatchCounters {
@@ -4281,6 +4375,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (MovedDispatchTemplates()) ReportMovedDispatch();
     resources->PatchPushConstants(pushBytes);
     timer.addressBased = resources->UsesAddressTable();
+    if (profile && cacheable) ProbeMovableKey(shaders[0], context.device, resources->UsesAddressTable(), resources->SpaceSerial(), fromCache);
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for
     // the longest call.

@@ -3660,6 +3660,10 @@ constexpr std::size_t HeldKeyedTables = 8;
 
 }
 
+std::uint64_t GuestBufferMemory::SpaceSerial() const {
+    return space != nullptr ? space->serial : 0;
+}
+
 std::shared_ptr<Buffer> GuestBufferMemory::HeldTable(std::uint64_t serial) const {
     if (space == nullptr || serial == 0) return nullptr;
     std::lock_guard lock(space->tableMutex);
