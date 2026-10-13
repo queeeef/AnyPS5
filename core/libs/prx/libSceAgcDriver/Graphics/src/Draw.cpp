@@ -2145,6 +2145,19 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
+        {
+            static std::mutex reasonMutex;
+            static std::array<std::uint64_t, 9> reasons{};
+            static auto window = std::chrono::steady_clock::now();
+            const std::size_t reason = recipeOut == nullptr ? 0u : !DrawRecipes() ? 1u : !cacheable ? 2u : outcome.waited ? 3u : args != nullptr ? 4u : !resources->Reusable() ? 5u : !resolved.moved.empty() ? 6u : multisampled ? 7u : 8u;
+            std::lock_guard reasonLock(reasonMutex);
+            ++reasons[reason];
+            if (std::chrono::steady_clock::now() - window >= std::chrono::seconds(10)) {
+                std::fprintf(stderr, "[local-recipe] draws by first recipe rejection (10 s): no recipe slot %llu, disabled %llu, not cacheable %llu, waited %llu, indirect %llu, not reusable %llu, moved %llu, multisampled %llu, eligible %llu\n", static_cast<unsigned long long>(reasons[0]), static_cast<unsigned long long>(reasons[1]), static_cast<unsigned long long>(reasons[2]), static_cast<unsigned long long>(reasons[3]), static_cast<unsigned long long>(reasons[4]), static_cast<unsigned long long>(reasons[5]), static_cast<unsigned long long>(reasons[6]), static_cast<unsigned long long>(reasons[7]), static_cast<unsigned long long>(reasons[8]));
+                reasons = {};
+                window = std::chrono::steady_clock::now();
+            }
+        }
         if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
