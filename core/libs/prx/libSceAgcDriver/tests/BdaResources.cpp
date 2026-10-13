@@ -235,6 +235,69 @@ void idleImportRetireTests(const Context& context) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void keyedTableTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(2 * piece, std::align_val_t{piece});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    std::memset(block, 0x5a, 2 * piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::uint8_t* range, bool writable, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, writable, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(guest, true, true);
+    change(guest + piece, false, true);
+    alignas(64) std::array<std::uint32_t, 64> copied{};
+    const auto copiedAddress = reinterpret_cast<std::uintptr_t>(copied.data());
+    const auto tableOf = [](const GuestBufferMemory& memory) {
+        const auto cached = memory.CachedAddressTable();
+        Require(cached.has_value() && cached->ranges != nullptr, "a build over the cached address space has no cached BDA table");
+        const auto ranges = memory.AddressRanges();
+        Require(cached->ranges->size() == ranges.size() && std::memcmp(cached->ranges->data(), ranges.data(), ranges.size() * sizeof(ranges.front())) == 0, "a cached BDA table differs from the build's own ranges");
+        const auto again = memory.CachedAddressTable();
+        Require(again.has_value() && again->serial == cached->serial && again->ranges == cached->ranges, "a build's cached BDA table changed between two calls");
+        return cached->serial;
+    };
+    std::uint64_t spaceSerial = 0;
+    {
+        GuestBufferMemory plain(importing);
+        plain.AcquireRegistered();
+        plain.Upload(true);
+        spaceSerial = tableOf(plain);
+        plain.WriteBack();
+    }
+    if (AddressSpaceCounters().enabled) {
+        for (const std::size_t offset : {0x100u, 0x2000u}) {
+            const auto before = AddressSpaceCounters();
+            GuestBufferMemory writer(importing);
+            writer.AcquireRegistered();
+            writer.AddWritable(first + offset, 64);
+            writer.Upload(true);
+            Require(tableOf(writer) == spaceSerial, "a write inside a writable import did not bind the address space's own table");
+            Require(AddressSpaceCounters().tablesOfSpace == before.tablesOfSpace + 1, "a write inside a writable import was not counted as the space's own table");
+            writer.WriteBack();
+        }
+        GuestBufferMemory own(importing);
+        own.AcquireRegistered();
+        own.AddWritable(copiedAddress, sizeof(copied));
+        own.Upload(true);
+        const auto keyedBefore = AddressSpaceCounters();
+        Require(tableOf(own) != spaceSerial, "a build with a region of its own bound the address space's own table");
+        const auto keyedAfter = AddressSpaceCounters();
+        Require(keyedAfter.tablesKeyed + keyedAfter.tablesByKey == keyedBefore.tablesKeyed + keyedBefore.tablesByKey + 1, "a build with a region of its own was not served by key");
+        const auto ranges = own.AddressRanges();
+        Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= copiedAddress && copiedAddress + sizeof(copied) <= range.end && (range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u; }), "a written region of the build's own is not writable in its BDA table");
+        own.WriteBack();
+    }
+    change(guest, true, false);
+    change(guest + piece, false, false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void importWindowTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     constexpr std::size_t window = 2 * piece;
@@ -1301,6 +1364,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importCrossingTests(context, access);
     importSpanTests(context);
     failedImportRemapTests(context, access);
+    keyedTableTests(context);
     importWindowTests(context);
     unwatchedImportWindowTests(context);
     idleImportRetireTests(context);
