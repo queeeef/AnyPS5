@@ -118,6 +118,7 @@ struct GuestBufferMemory::AddressSpace {
     };
     mutable std::mutex tableMutex;
     mutable std::list<KeyedTable> keyedTables;
+    mutable std::shared_ptr<Buffer> table;
 };
 
 namespace {
@@ -2269,7 +2270,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
     const auto space = AddressSpaceCounters();
     const auto& spaceSeen = totals.spaceSeen;
-    AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), us per build: table %.0f, fault buffer %.0f; tables by key: the space's own %llu, keyed hits %llu, keyed builds %llu, unkeyed %llu; first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), per(static_cast<double>(table.tableNanoseconds - seen.tableNanoseconds) / 1000.0), per(static_cast<double>(table.faultNanoseconds - seen.faultNanoseconds) / 1000.0), delta(space.tablesOfSpace, spaceSeen.tablesOfSpace), delta(space.tablesByKey, spaceSeen.tablesByKey), delta(space.tablesKeyed, spaceSeen.tablesKeyed), delta(space.tablesUnkeyed, spaceSeen.tablesUnkeyed), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu, held by the space %llu), us per build: table %.0f, fault buffer %.0f; tables by key: the space's own %llu, keyed hits %llu, keyed builds %llu, unkeyed %llu; first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.heldTables, seen.heldTables), per(static_cast<double>(table.tableNanoseconds - seen.tableNanoseconds) / 1000.0), per(static_cast<double>(table.faultNanoseconds - seen.faultNanoseconds) / 1000.0), delta(space.tablesOfSpace, spaceSeen.tablesOfSpace), delta(space.tablesByKey, spaceSeen.tablesByKey), delta(space.tablesKeyed, spaceSeen.tablesKeyed), delta(space.tablesUnkeyed, spaceSeen.tablesUnkeyed), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -3650,6 +3651,19 @@ std::optional<std::vector<std::uint64_t>> GuestBufferMemory::tableKey() const {
     }
     key.insert(key.end(), clips.begin(), clips.end());
     return key;
+}
+
+std::shared_ptr<Buffer> GuestBufferMemory::SpaceTable(std::uint64_t serial) const {
+    if (space == nullptr || space->serial != serial) return nullptr;
+    std::lock_guard lock(space->tableMutex);
+    return space->table;
+}
+
+void GuestBufferMemory::KeepSpaceTable(std::uint64_t serial, const std::shared_ptr<Buffer>& table) const {
+    Require(table != nullptr, "no BDA table to keep");
+    if (space == nullptr || space->serial != serial) return;
+    std::lock_guard lock(space->tableMutex);
+    if (space->table == nullptr) space->table = table;
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {

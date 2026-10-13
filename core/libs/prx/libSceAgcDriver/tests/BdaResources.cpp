@@ -1,4 +1,5 @@
 #include "BdaTests.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
@@ -271,6 +272,18 @@ void keyedTableTests(const Context& context) {
         plain.WriteBack();
     }
     if (AddressSpaceCounters().enabled) {
+        VkBuffer spaceTable = VK_NULL_HANDLE;
+        for (int build = 0; build < 2; ++build) {
+            GuestBufferMemory plain(importing);
+            plain.AcquireRegistered();
+            plain.Upload(true);
+            const auto before = BdaResources::TableCacheCounters();
+            const BdaResources resources(importing, plain);
+            const auto after = BdaResources::TableCacheCounters();
+            if (build == 0) spaceTable = resources.Table().buffer;
+            else Require(resources.Table().buffer == spaceTable && after.heldTables == before.heldTables + 1, "a build of an unchanged address space was not served by the table the space kept");
+            plain.WriteBack();
+        }
         for (const std::size_t offset : {0x100u, 0x2000u}) {
             const auto before = AddressSpaceCounters();
             GuestBufferMemory writer(importing);

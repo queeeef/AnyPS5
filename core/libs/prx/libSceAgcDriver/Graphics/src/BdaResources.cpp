@@ -172,6 +172,13 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
         if (!cached.has_value()) ++cache.classes.mergedTables;
         if (serial != 0) {
+            if (auto held = memory.SpaceTable(serial); held != nullptr) {
+                ++cache.hits;
+                ++cache.classes.spaceTables;
+                ++cache.classes.heldTables;
+                table = std::move(held);
+                return;
+            }
             for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
                 if (it->spaceSerial != serial) continue;
                 if (auto shared = it->buffer.lock(); shared != nullptr) {
@@ -179,6 +186,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                     ++cache.classes.spaceTables;
                     table = std::move(shared);
                     cache.entries.splice(cache.entries.begin(), cache.entries, it);
+                    memory.KeepSpaceTable(serial, table);
                     return;
                 }
                 cache.entries.erase(it);
@@ -212,6 +220,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 if (serial != 0) it->spaceSerial = serial;
                 table = std::move(shared);
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
+                memory.KeepSpaceTable(serial, table);
                 return;
             }
             ++it;
@@ -232,6 +241,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
+    if (serial != 0 && tableCacheEnabled()) memory.KeepSpaceTable(serial, table);
 }
 
 BdaResources::TableCacheStats BdaResources::TableCacheCounters() {

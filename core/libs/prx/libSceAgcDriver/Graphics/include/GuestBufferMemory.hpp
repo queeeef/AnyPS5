@@ -242,6 +242,8 @@ public:
         const std::vector<ShaderRecompiler::BdaAbi::Range>* ranges;
     };
     std::optional<CachedTable> CachedAddressTable() const;
+    std::shared_ptr<Buffer> SpaceTable(std::uint64_t serial) const;
+    void KeepSpaceTable(std::uint64_t serial, const std::shared_ptr<Buffer>& table) const;
     // The registered memory an address-based build maps, shared by consecutive builds (see
     // GuestBufferMemory.cpp): its lease and the sorted, immutable regions of the ranges served in
     // place by imports and mirrors. Opaque outside GuestBufferMemory.cpp.
