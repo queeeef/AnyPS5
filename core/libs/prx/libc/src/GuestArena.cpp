@@ -321,6 +321,11 @@ bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleWrite(address);
 }
 
+void GuestArenaThreadCounters_nid_postfix(std::uint64_t* counters, std::size_t count) {
+    const std::uint64_t values[] = {localArenaCounters.collects, localArenaCounters.queries, localArenaCounters.armProtects, localArenaCounters.handledWrites, localArenaCounters.drained, localArenaCounters.hostOpens};
+    for (std::size_t i = 0; i < count && i < std::size(values); ++i) counters[i] = values[i];
+}
+
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) return;
     WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);

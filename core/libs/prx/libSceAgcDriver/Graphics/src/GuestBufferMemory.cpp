@@ -2183,6 +2183,13 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
                 std::fprintf(stderr, "[local-import-lookups] 10 s: %llu HostImportFor calls, %llu fast hits, slow: %llu registry changed, %llu device changed, %llu not imported yet (%llu not covered by one registered run, %llu import refused); %llu remembered misses; %.1f ms in slow paths; registry generation advanced %llu; %zu imports\n", static_cast<unsigned long long>(lookups.calls), static_cast<unsigned long long>(lookups.hits), static_cast<unsigned long long>(lookups.staleGeneration), static_cast<unsigned long long>(lookups.staleDevice), static_cast<unsigned long long>(lookups.misses), static_cast<unsigned long long>(lookups.uncovered), static_cast<unsigned long long>(lookups.importFailed), static_cast<unsigned long long>(lookups.remembered), lookups.slowMs, static_cast<unsigned long long>(generation - lookups.generationAtWindow), state.imports.size());
                 lookups = LocalImportLookups{};
                 lookups.generationAtWindow = generation;
+#ifdef _WIN32
+                std::uint64_t arena[6]{};
+                GuestArena::GuestArenaThreadCounters_nid_postfix(arena, 6);
+                static thread_local std::uint64_t previous[6]{};
+                std::fprintf(stderr, "[local-arena-thread] thread %lu 10 s: %llu write-watch collects, %llu VirtualQuery, %llu VirtualProtect re-arms, %llu write faults handled here, %llu debugger-resolved faults drained, %llu host-write opens\n", static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(arena[0] - previous[0]), static_cast<unsigned long long>(arena[1] - previous[1]), static_cast<unsigned long long>(arena[2] - previous[2]), static_cast<unsigned long long>(arena[3] - previous[3]), static_cast<unsigned long long>(arena[4] - previous[4]), static_cast<unsigned long long>(arena[5] - previous[5]));
+                for (int i = 0; i < 6; ++i) previous[i] = arena[i];
+#endif
             }
         }
         notes = !state.unwatchedNotes.empty();

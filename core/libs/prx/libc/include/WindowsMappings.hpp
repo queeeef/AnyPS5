@@ -20,6 +20,17 @@
 
 namespace GuestArena {
 
+struct LocalArenaCounters {
+    std::uint64_t collects = 0;
+    std::uint64_t queries = 0;
+    std::uint64_t armProtects = 0;
+    std::uint64_t handledWrites = 0;
+    std::uint64_t drained = 0;
+    std::uint64_t hostOpens = 0;
+};
+
+inline thread_local LocalArenaCounters localArenaCounters;
+
 class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
@@ -204,6 +215,7 @@ public:
         invalidate(*view.page);
         DWORD previous;
         markFault(base, FaultDebugger::Disarmed);
+        ++localArenaCounters.handledWrites;
         if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume shared memory write");
         view.armed = false;
         return true;
@@ -224,6 +236,7 @@ public:
             if (!view.armed) continue;
             DWORD previous;
             markFault(it->first, FaultDebugger::Disarmed);
+            ++localArenaCounters.hostOpens;
             if (!VirtualProtect(reinterpret_cast<void*>(it->first), pageBytes, view.protection, &previous)) fail("open shared memory to a host write");
             view.armed = false;
         }
@@ -296,6 +309,7 @@ public:
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
+        ++localArenaCounters.collects;
         std::lock_guard lock(mutex);
         drainFaults();
         const auto capacity = *count;
@@ -361,6 +375,7 @@ public:
                         DWORD previous;
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
                         markFault(alias, other.protection == PAGE_EXECUTE_READWRITE ? FaultDebugger::ArmedExecuteReadWrite : FaultDebugger::ArmedReadWrite);
+                        ++localArenaCounters.armProtects;
                         if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
                         other.armed = true;
                     }
@@ -408,6 +423,7 @@ private:
         if (faultHeader == nullptr) return;
         const auto head = std::atomic_ref<std::uint64_t>(faultHeader->head).load(std::memory_order_acquire);
         auto tail = faultHeader->tail;
+        localArenaCounters.drained += head > tail ? head - tail : 0;
         for (; tail < head; ++tail) consumeFault(faultBase + static_cast<std::uintptr_t>(faultHeader->ring[tail % FaultDebugger::RingSize]) * pageBytes);
         std::atomic_ref<std::uint64_t>(faultHeader->tail).store(tail, std::memory_order_release);
         if (std::atomic_ref<std::uint32_t>(faultHeader->overflow).exchange(0) != 0) {
@@ -512,6 +528,7 @@ private:
     }
 
     static MEMORY_BASIC_INFORMATION query(std::uintptr_t address) {
+        ++localArenaCounters.queries;
         MEMORY_BASIC_INFORMATION memory{};
         if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) != sizeof(memory)) fail("query guest memory");
         return memory;
