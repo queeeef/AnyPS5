@@ -56,25 +56,49 @@ struct Sampler {
         if (target != nullptr && !CloseHandle(target)) throw std::system_error(GetLastError(), std::system_category(), "Closing sampler thread handle");
     }
 
+    std::vector<std::uint8_t> stackCopy = std::vector<std::uint8_t>(64u << 10u);
+
     void sample() {
         CONTEXT context{};
         context.ContextFlags = CONTEXT_FULL;
         if (SuspendThread(target) == static_cast<DWORD>(-1)) return;
         const bool captured = GetThreadContext(target, &context) != 0;
+        SIZE_T copied = 0;
+        if (captured) {
+            MEMORY_BASIC_INFORMATION region{};
+            std::size_t want = stackCopy.size();
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(context.Rsp), &region, sizeof(region)) != 0) {
+                const auto regionEnd = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
+                want = static_cast<std::size_t>(std::min<std::uint64_t>(want, regionEnd > context.Rsp ? regionEnd - context.Rsp : 0));
+            }
+            if (want == 0 || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Rsp), stackCopy.data(), want, &copied)) copied = 0;
+        }
+        ResumeThread(target);
         std::vector<std::uint64_t> frames;
         if (captured) {
-            // Unwinding reads the target's stack while it is suspended. A frame without unwind data is a
-            // leaf (return address at RSP) when that address has unwind data, else walked by its RBP chain.
-            const auto read = [](std::uint64_t address, std::uint64_t& value) {
-                SIZE_T got = 0;
-                return address % 8 == 0 && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address), &value, sizeof(value), &got) && got == sizeof(value);
+            // The target runs again: its registers and a copy of its stack are unwound here, so no lock a
+            // suspended thread may hold (heap, loader, function tables) is ever taken while it is suspended.
+            // A frame without unwind data is a leaf (return address at RSP) when that address has unwind
+            // data, else walked by its RBP chain; the walk ends where it leaves the copy.
+            const auto originalRsp = context.Rsp;
+            const auto copyBase = reinterpret_cast<std::uint64_t>(stackCopy.data());
+            const auto inOriginal = [&](std::uint64_t address) { return address >= originalRsp && address - originalRsp + 8 <= copied; };
+            const auto inCopy = [&](std::uint64_t address) { return address >= copyBase && address - copyBase + 8 <= copied; };
+            const auto read = [&](std::uint64_t address, std::uint64_t& value) {
+                if (!inCopy(address)) return false;
+                std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+                return true;
             };
             const auto unwound = [](std::uint64_t address) {
                 DWORD64 base = 0;
                 return address != 0 && RtlLookupFunctionEntry(address, &base, nullptr) != nullptr;
             };
+            context.Rsp = copyBase;
+            if (inOriginal(context.Rbp)) context.Rbp = copyBase + (context.Rbp - originalRsp);
             for (int depth = 0; depth < 64 && context.Rip != 0; ++depth) {
                 frames.push_back(context.Rip);
+                if (!inCopy(context.Rsp)) break;
+                if (inOriginal(context.Rbp)) context.Rbp = copyBase + (context.Rbp - originalRsp);
                 DWORD64 imageBase = 0;
                 auto* entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
                 if (entry != nullptr) {
@@ -91,13 +115,12 @@ struct Sampler {
                 }
                 std::uint64_t savedFrame = 0;
                 std::uint64_t frameReturn = 0;
-                if (context.Rbp < context.Rsp || context.Rbp - context.Rsp > (8u << 20u) || !read(context.Rbp, savedFrame) || !read(context.Rbp + 8, frameReturn) || frameReturn == 0) break;
+                if (context.Rbp < context.Rsp || !read(context.Rbp, savedFrame) || !read(context.Rbp + 8, frameReturn) || frameReturn == 0) break;
                 context.Rip = frameReturn;
                 context.Rsp = context.Rbp + 16;
-                context.Rbp = savedFrame;
+                context.Rbp = inOriginal(savedFrame) ? copyBase + (savedFrame - originalRsp) : savedFrame;
             }
         }
-        ResumeThread(target);
         std::lock_guard lock(mutex);
         ++samples;
         for (std::size_t i = 0; i < frames.size(); ++i) {
