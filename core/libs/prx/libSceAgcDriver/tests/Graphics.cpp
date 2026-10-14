@@ -3610,68 +3610,6 @@ void barycentricEmulationTests() {
     expectFailure([&] { static_cast<void>(BuildBarycentricGeometryShader(vertex, fragment, target, limits)); }, "not exported by the vertex shader");
 }
 
-void movedDispatchBindingTests() {
-    using namespace ShaderRecompiler;
-    using namespace AgcDriver::Graphics;
-    constexpr std::size_t piece = 65536;
-    void* block = ::operator new(piece, std::align_val_t{piece});
-    auto* guest = static_cast<std::uint8_t*>(block);
-    std::memset(block, 0x5c, piece);
-    for (std::size_t index = 0; index < 64; ++index) guest[0x2000 + index] = static_cast<std::uint8_t>(index);
-    {
-        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, piece, true, false, true);
-        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
-    }
-    mock = MockVulkan{};
-    mock.allowCopies = true;
-    auto context = mockContext();
-    context.hostImportAlignment = piece;
-    context.limits.minStorageBufferOffsetAlignment = 16;
-    context.limits.maxStorageBufferRange = 1u << 27;
-    {
-        DescriptorCache cache(context);
-        context.descriptorCache = &cache;
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        Recorder recorder(context);
-        RecompileResult built;
-        RecompileResult later;
-        built.runtimeAbiVersion = RuntimeAbi::Version;
-        later.runtimeAbiVersion = RuntimeAbi::Version;
-        auto builtBinding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guest + 0x100, 64), vsharp(guest + 0x1000, 64)));
-        builtBinding.bufferWritten = {false, false};
-        built.bindings = {builtBinding};
-        auto laterBinding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guest + 0x2000, 64), vsharp(guest + 0x1000, 64)));
-        laterBinding.bufferWritten = {false, false};
-        later.bindings = {laterBinding};
-        const CompiledShader builtShader{ShaderStage::Compute, &built, 0};
-        const CompiledShader laterShader{ShaderStage::Compute, &later, 0};
-        Require(ShaderResources::ContentKey(builtShader, false, true) == ShaderResources::ContentKey(laterShader, false, true), "a read-only buffer's address is part of the movable dispatch key");
-        Require(ShaderResources::ContentKey(builtShader, false) != ShaderResources::ContentKey(laterShader, false), "the exact dispatch key ignores a read-only buffer's address");
-        ShaderResources resources(context, builtShader);
-        const auto original = findWrite(0).buffers;
-        const auto found = resources.MovedReadOnlyBuffers(std::span(&laterShader, 1), recorder, true);
-        Require(found.has_value() && found->size() == 1 && found->front().allocation == 0 && found->front().address == reinterpret_cast<std::uintptr_t>(guest + 0x2000) && found->front().size == 64 && found->front().words.empty(), "the moved read-only buffer of a dispatch was not found");
-        mock.writes.clear();
-        const auto bindings = resources.PrepareDrawBindings(recorder, *found, false);
-        Require(bindings != nullptr && bindings->allocation.set != VK_NULL_HANDLE && bindings->snapshots.size() == 1, "a dispatch's own descriptor set copied a buffer that did not move");
-        const auto& write = findWrite(0);
-        Require(write.count == 2 && write.buffers[1].buffer == original[1].buffer && write.buffers[1].offset == original[1].offset && write.buffers[1].range == original[1].range, "a dispatch's own descriptor set changed a buffer that did not move");
-        Require(write.buffers[0].buffer == bindings->snapshots.front().buffer->Handle() && write.buffers[0].offset == 0 && sameBytes(bufferBytes(write.buffers[0].buffer), guest + 0x2000, 64), "a moved read-only buffer was not bound with the bytes at its new address");
-        const auto drawBindings = resources.PrepareDrawBindings(recorder, *found);
-        Require(drawBindings != nullptr && drawBindings->snapshots.size() == 2, "a draw's own descriptor set no longer copies the buffers read in place");
-        recorder.Sync();
-    }
-    ClearHostImports(context.device);
-    Require(mock.live == 0, "a dispatch's own descriptor set leaked Vulkan objects");
-    {
-        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
-        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
-    }
-    ::operator delete(block, std::align_val_t{piece});
-}
-
 void copiedWriterIndirectOverlapTests() {
     using namespace ShaderRecompiler;
     using namespace AgcDriver::Graphics;
@@ -5387,7 +5325,6 @@ int main(int argc, char** argv) {
         floatControlsModeTests();
         barycentricEmulationTests();
         copiedWriterIndirectOverlapTests();
-        movedDispatchBindingTests();
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;
