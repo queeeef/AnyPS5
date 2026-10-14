@@ -59,6 +59,9 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 // page tables and are reported with MarkWritten. Without write watching CollectWrites returns 0 and
 // UnchangedSince is always false, so callers fall back to comparing bytes.
 bool WriteWatched();
+// Advances whenever the watched coverage changes (an Unwatch that excluded pages, a private mapping
+// watched again, a Rewatch): Watched() answers can only have changed when it moved.
+std::uint64_t UnwatchSerial();
 void Unwatch(std::uint64_t address, std::size_t bytes);
 void Rewatch(std::uint64_t address, std::size_t bytes);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import);

@@ -70,6 +70,16 @@ const HostImport* ExistingHostImport(const Context& context, std::uint64_t addre
 bool HostImportsUnwatch(const Context& context);
 const HostImport* StorageImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
 std::size_t RetireIdleImports(const Context& context);
+// Totals since start of the imports' reconciles (refreshImports): those that checked only the imports
+// a registry change touched, the whole walks, and the leases taken around a range or of the whole
+// registry. For tests of the incremental reconcile.
+struct HostImportReconcileTotals {
+    std::uint64_t incremental = 0;
+    std::uint64_t full = 0;
+    std::uint64_t aroundLeases = 0;
+    std::uint64_t wholeLeases = 0;
+};
+HostImportReconcileTotals HostImportReconcileCounts();
 void SetHostImportWindow(std::uint64_t bytes);
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports

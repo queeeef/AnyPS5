@@ -46,6 +46,18 @@ Lease GuestAllocationsAcquireAll_nid_postfix();
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next);
 // Changes whenever a mutation ends, so callers can cache facts about guest mappings between changes.
 std::uint64_t GuestAllocationsGeneration_nid_postfix();
+// The ranges changed after generation `since`, as (generation, begin, end) triples in generation
+// order: every range a mutation ending later recorded (the ranges the invalidator is given), so a
+// cache of facts about ranges a change did not touch stays valid across it. Returns the generation
+// the triples reach; *count receives their number, or SIZE_MAX when the log no longer holds every
+// change after `since` or `capacity` triples are too few (the caller then drops its cache).
+std::uint64_t GuestAllocationsChangedSince_nid_postfix(std::uint64_t since, std::uint64_t* triples, std::size_t capacity, std::size_t* count);
+// A lease of the readable ranges overlapping or touching [begin, end), extended on both sides
+// through every neighbor that continues a run with it (contiguous, readable, same writability and
+// GPU flag: the run rule of the driver's host imports), in address order like Acquire's: what a run
+// lookup around the range reads of a full lease. *complete is false (and the lease empty) when more
+// than `limit` ranges would be returned.
+Lease GuestAllocationsAcquireAround_nid_postfix(std::uintptr_t begin, std::uintptr_t end, std::size_t limit, bool* complete);
 // Precise invalidation for such caches: the callback runs, after the generation changed, for every
 // range whose mapping or protection changed (registry mutations and guest heap decommits).
 void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));

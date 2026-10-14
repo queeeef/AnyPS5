@@ -74,6 +74,34 @@ void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
     if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
+// The changed ranges of the latest mutations and invalidations, tagged with the generation their end
+// produced (GuestAllocationsChangedSince). The generation is bumped under this mutex together with
+// the appends, so a reader never sees a generation whose changes are not logged yet. `dropped` is
+// the newest generation an overwritten entry carried.
+struct ChangeLog {
+    struct Entry {
+        std::uint64_t generation;
+        std::uint64_t begin;
+        std::uint64_t end;
+    };
+    std::mutex mutex;
+    std::vector<Entry> entries = std::vector<Entry>(std::size_t{1} << 14);
+    std::uint64_t next = 0;
+    std::uint64_t dropped = 0;
+
+    void append(std::uint64_t generation, std::uintptr_t address, std::size_t bytes) {
+        auto& slot = entries[next % entries.size()];
+        if (next >= entries.size()) dropped = std::max(dropped, slot.generation);
+        slot = {generation, address, address + bytes};
+        ++next;
+    }
+};
+
+ChangeLog& changeLog() {
+    static ChangeLog log;
+    return log;
+}
+
 #ifndef _WIN32
 std::vector<std::pair<std::uintptr_t, std::size_t>> fileBackedWritableImage() {
     const auto image = std::filesystem::read_symlink("/proc/self/exe").string();
@@ -114,7 +142,13 @@ void* GuestAllocationsBegin_nid_postfix() {
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
-    const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
+    std::uint64_t ended = 0;
+    {
+        auto& log = changeLog();
+        std::lock_guard logLock(log.mutex);
+        ended = generation.fetch_add(1, std::memory_order_release) + 1;
+        for (const auto& [address, bytes] : state->changed) log.append(ended, address, bytes);
+    }
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
     }
@@ -150,8 +184,45 @@ void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t,
     invalidator.store(callback, std::memory_order_release);
 }
 
+std::uint64_t GuestAllocationsChangedSince_nid_postfix(std::uint64_t since, std::uint64_t* triples, std::size_t capacity, std::size_t* count) {
+    auto& log = changeLog();
+    std::lock_guard lock(log.mutex);
+    const auto current = generation.load(std::memory_order_acquire);
+    if (since > current || log.dropped > since) {
+        *count = SIZE_MAX;
+        return current;
+    }
+    // Entries are appended in generation order: the first one after `since` is found by search.
+    const auto first = log.next > log.entries.size() ? log.next - log.entries.size() : 0;
+    auto low = first;
+    auto high = log.next;
+    while (low < high) {
+        const auto middle = low + (high - low) / 2;
+        if (log.entries[middle % log.entries.size()].generation <= since) low = middle + 1;
+        else high = middle;
+    }
+    if (log.next - low > capacity) {
+        *count = SIZE_MAX;
+        return current;
+    }
+    std::size_t written = 0;
+    for (auto index = low; index < log.next; ++index, ++written) {
+        const auto& entry = log.entries[index % log.entries.size()];
+        triples[3 * written] = entry.generation;
+        triples[3 * written + 1] = entry.begin;
+        triples[3 * written + 2] = entry.end;
+    }
+    *count = written;
+    return current;
+}
+
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
-    generation.fetch_add(1, std::memory_order_release);
+    {
+        auto& log = changeLog();
+        std::lock_guard logLock(log.mutex);
+        const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
+        if (bytes != 0) log.append(ended, address, bytes);
+    }
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
 }
 
@@ -170,7 +241,7 @@ void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)(std::uintptr_t, s
 
 #ifdef _WIN32
 namespace {
-void registerImage(const void* image) {
+void registerImage(void* mutation, const void* image) {
     auto& state = registry();
     if (state.registeredImages.contains(reinterpret_cast<std::uintptr_t>(image))) return;
     auto replacement = state.ranges;
@@ -202,21 +273,22 @@ void registerImage(const void* image) {
     require(registered, "guest image has no committed pages");
     state.ranges.swap(replacement);
     state.registeredImages.emplace(reinterpret_cast<std::uintptr_t>(image), cursor);
+    recordChange(mutation, image, cursor - reinterpret_cast<std::uintptr_t>(image));
 }
 }
 
-void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
+void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation) {
     auto& state = registry();
     if (state.mainImageRegistered) return;
     const auto image = GetModuleHandleW(nullptr);
     require(image != nullptr, "cannot locate the main guest image");
-    registerImage(image);
+    registerImage(mutation, image);
     state.mainImageRegistered = true;
 }
 
-void GuestAllocationsRegisterImage_nid_postfix(void*, const void* image) {
+void GuestAllocationsRegisterImage_nid_postfix(void* mutation, const void* image) {
     require(image != nullptr, "cannot register a guest image without a base");
-    registerImage(image);
+    registerImage(mutation, image);
 }
 
 void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* image) {
@@ -230,7 +302,7 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     state.registeredImages.erase(found);
 }
 #else
-void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
+void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation) {
     auto& state = registry();
     if (state.mainImageRegistered) return;
     struct Page {
@@ -269,6 +341,7 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
             require(previous.address + previous.bytes <= address, "guest image overlaps a registered allocation");
         }
         replacement.emplace(address, std::make_shared<const Range>(Range{address, bytes, page->second.readable, page->second.writable, address, bytes, false}));
+        recordChange(mutation, reinterpret_cast<const void*>(address), bytes);
         page = std::next(last);
     }
     state.ranges.swap(replacement);
@@ -537,6 +610,60 @@ std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t a
         }
     }
     return nullptr;
+}
+
+Lease GuestAllocationsAcquireAround_nid_postfix(std::uintptr_t begin, std::uintptr_t end, std::size_t limit, bool* complete) {
+    std::lock_guard lock(registry().mutex);
+    const auto& ranges = registry().ranges;
+    const auto leased = [](const Range& range) { return range.readable && range.bytes != 0; };
+    const auto continues = [](const Range& before, const Range& after) {
+        return before.address + before.bytes == after.address && before.readable && after.readable && before.writable == after.writable && before.gpu == after.gpu;
+    };
+    *complete = false;
+    // The first range ending at or after `begin` (a range ending exactly there touches it).
+    auto first = ranges.upper_bound(begin);
+    if (first != ranges.begin() && std::prev(first)->second->address + std::prev(first)->second->bytes >= begin) --first;
+    auto last = first;
+    while (last != ranges.end() && last->first <= end) ++last;
+    // Extend backward and forward through neighbors that continue a run, as importRun does over the
+    // lease (which holds only readable, non-empty ranges, so those are the neighbors compared).
+    const auto previousLeased = [&](auto it) {
+        while (it != ranges.begin()) {
+            --it;
+            if (leased(*it->second)) return it;
+        }
+        return ranges.end();
+    };
+    if (first != last) {
+        auto anchor = first;
+        while (anchor != last && !leased(*anchor->second)) ++anchor;
+        if (anchor != last) {
+            for (auto previous = previousLeased(anchor); previous != ranges.end() && continues(*previous->second, *anchor->second); previous = previousLeased(anchor)) {
+                anchor = previous;
+                first = previous;
+            }
+        }
+    }
+    auto tail = ranges.end();
+    for (auto it = first; it != last; ++it) {
+        if (leased(*it->second)) tail = it;
+    }
+    if (tail != ranges.end()) {
+        for (auto next = std::next(tail); next != ranges.end(); ++next) {
+            if (!leased(*next->second)) continue;
+            if (!continues(*tail->second, *next->second)) break;
+            tail = next;
+            last = std::next(next);
+        }
+    }
+    Lease result;
+    for (auto it = first; it != last; ++it) {
+        if (!leased(*it->second)) continue;
+        if (result.size() == limit) return {};
+        result.push_back(it->second);
+    }
+    *complete = true;
+    return result;
 }
 
 Lease GuestAllocationsAcquireAll_nid_postfix() {

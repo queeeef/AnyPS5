@@ -28,6 +28,7 @@
 #include <bit>
 #include <condition_variable>
 #include <iterator>
+#include <deque>
 #include <list>
 #include <map>
 #include <mutex>
@@ -180,6 +181,21 @@ struct HostImports {
     std::set<std::uint64_t> unaliasedSpans;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
+    // What the last reconcile also depended on besides the registry (see refreshImportsIncrementally).
+    std::uint64_t refreshedWindow = 0;
+    std::size_t refreshedUnaliased = 0;
+    std::uint64_t refreshedWatchSerial = 0;
+    // The driver's copy of the registry's change log (GuestAllocationsChangedSince): every change
+    // with a generation in (changesFrom, changesTo] is in `changes`, in generation order.
+    struct RegistryChange {
+        std::uint64_t generation;
+        std::uint64_t begin;
+        std::uint64_t end;
+    };
+    std::deque<RegistryChange> changes;
+    std::uint64_t changesFrom = 0;
+    std::uint64_t changesTo = 0;
+    std::vector<std::uint64_t> changeTriples;
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
     // reused while it is unchanged.
     std::uint64_t epoch = 1;
@@ -905,9 +921,191 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
     return range->readable && begin >= range->address && end <= range->address + range->bytes ? range.get() : nullptr;
 }
 
+bool incrementalImports() {
+    static const bool disabled = std::getenv("APS5_NO_INCREMENTAL_IMPORTS") != nullptr;
+    return !disabled;
+}
+
+// APS5_PROFILE_DRAW counters for the [local-import-lookups] line.
+struct LocalImportReconcile {
+    std::uint64_t incremental = 0;
+    std::uint64_t checked = 0;
+    std::uint64_t retired = 0;
+    std::uint64_t full = 0;
+    std::uint64_t fullNoLog = 0;
+    std::uint64_t fullSettings = 0;
+    std::uint64_t watchPasses = 0;
+    std::uint64_t smallLeases = 0;
+    std::uint64_t fullLeases = 0;
+    std::uint64_t rememberedByLog = 0;
+};
+
+LocalImportReconcile& localImportReconcile() {
+    static LocalImportReconcile counters;
+    return counters;
+}
+
+HostImportReconcileTotals& reconcileTotals() {
+    static HostImportReconcileTotals totals;
+    return totals;
+}
+
+// Brings `state.changes` up to the registry's current generation; on an overrun the copy restarts
+// empty from there (changes before it are unknown).
+void pullRegistryChanges(HostImports& state) {
+    const auto current = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (current == state.changesTo) return;
+    constexpr std::size_t capacity = 4096;
+    auto& triples = state.changeTriples;
+    if (triples.size() < 3 * capacity) triples.resize(3 * capacity);
+    std::size_t count = 0;
+    const auto reached = GuestAllocations::GuestAllocationsChangedSince_nid_postfix(state.changesTo, triples.data(), capacity, &count);
+    if (count == SIZE_MAX) {
+        state.changes.clear();
+        state.changesFrom = state.changesTo = reached;
+        return;
+    }
+    for (std::size_t i = 0; i < count; ++i) state.changes.push_back({triples[3 * i], triples[3 * i + 1], triples[3 * i + 2]});
+    state.changesTo = reached;
+    while (state.changes.size() > 8192) {
+        state.changesFrom = std::max(state.changesFrom, state.changes.front().generation);
+        state.changes.pop_front();
+    }
+}
+
+// The registry changes after generation `since`, merged into sorted [begin, end) intervals, or
+// nothing when the copy does not reach back to `since`.
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> registryChangesSince(HostImports& state, std::uint64_t since) {
+    pullRegistryChanges(state);
+    if (since < state.changesFrom || since > state.changesTo) return std::nullopt;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
+    for (auto it = state.changes.rbegin(); it != state.changes.rend() && it->generation > since; ++it) intervals.emplace_back(it->begin, it->end);
+    std::sort(intervals.begin(), intervals.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& interval : intervals) {
+        if (!merged.empty() && interval.first <= merged.back().second) merged.back().second = std::max(merged.back().second, interval.second);
+        else merged.push_back(interval);
+    }
+    return merged;
+}
+
+// Whether a change in `merged` overlaps or touches [begin, end]: a run of registered ranges is
+// decided by the ranges inside it and its direct neighbors, so only such a change can alter it.
+bool touchedByChanges(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& merged, std::uint64_t begin, std::uint64_t end) {
+    const auto found = std::upper_bound(merged.begin(), merged.end(), end, [](std::uint64_t value, const auto& interval) { return value < interval.first; });
+    return found != merged.begin() && std::prev(found)->second >= begin;
+}
+
+// The keys of a map of [base, base + bytes) entries (imports, failures) touched by a change.
+template<typename Map, typename Span>
+std::vector<std::uint64_t> touchedKeys(const Map& entries, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& merged, Span span) {
+    std::vector<std::uint64_t> keys;
+    for (const auto& [changeBegin, changeEnd] : merged) {
+        auto it = entries.lower_bound(changeBegin);
+        if (it != entries.begin()) --it;
+        for (; it != entries.end() && it->first <= changeEnd; ++it) {
+            const auto [begin, end] = span(it->second);
+            if (end >= changeBegin && begin <= changeEnd) keys.push_back(it->first);
+        }
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
+
+// The readable ranges around [begin, end) that a run lookup there reads (GuestAllocationsAcquireAround),
+// or nothing when there are too many.
+std::optional<GuestAllocations::Lease> leaseAround(std::uint64_t begin, std::uint64_t end) {
+    bool complete = false;
+    auto lease = GuestAllocations::GuestAllocationsAcquireAround_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::uintptr_t>(end), 4096, &complete);
+    if (!complete) return std::nullopt;
+    ++localImportReconcile().smallLeases;
+    ++reconcileTotals().aroundLeases;
+    return lease;
+}
+
+void reconcileImport(const Context& context, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease) {
+    const auto* range = leasedRangeAt(lease, it->first);
+    if (range != nullptr && sameRange(it->second, lease)) {
+        if (it->second.unwatched && GuestMemory::Watched(it->first, static_cast<std::size_t>(it->second.bytes))) {
+            GuestMemory::Unwatch(it->first, it->second.bytes);
+            state.unwatchedNotes.emplace_back(it->first, it->second.bytes);
+        }
+        return;
+    }
+    static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
+    if (trace && range != nullptr && range->bytes == it->second.bytes) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
+    ++localImportReconcile().retired;
+    retireImport(context.device, state, it, lease);
+}
+
+// refreshImports without the walk: only the imports and failures a registry change since the last
+// reconcile overlaps or touches are checked, each against the registry's ranges around it as they
+// are now, which is what the walk decides for them against a full lease; an untouched one has the
+// same ranges and neighbors as when it was last confirmed, so the walk would keep it. The import
+// window and the unaliased spans also shape runs: a change of either takes the walk. The Watched
+// re-check of unwatched imports runs over all of them only when the watched coverage changed.
+// Returns false (having changed nothing that the walk would not) when the walk is needed.
+bool refreshImportsIncrementally(const Context& context, HostImports& state) {
+    auto& counters = localImportReconcile();
+    if (!incrementalImports() || state.refreshedGeneration == 0) return false;
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    if (window != state.refreshedWindow || state.unaliasedSpans.size() != state.refreshedUnaliased) {
+        ++counters.fullSettings;
+        return false;
+    }
+    const auto changes = registryChangesSince(state, state.refreshedGeneration);
+    if (!changes) {
+        ++counters.fullNoLog;
+        return false;
+    }
+    const auto reached = state.changesTo;
+    const auto watchSerial = GuestMemory::UnwatchSerial();
+    for (const auto key : touchedKeys(state.imports, *changes, [](const HostImport& entry) { return std::pair{entry.base, entry.base + entry.bytes}; })) {
+        const auto it = state.imports.find(key);
+        if (it == state.imports.end()) continue;
+        const auto around = leaseAround(it->second.base, it->second.base + it->second.bytes);
+        if (!around) return false;
+        ++counters.checked;
+        reconcileImport(context, state, it, *around);
+    }
+    const auto failureSpan = [](const ImportFailure& failure) { return std::pair{failure.base, failure.base + failure.bytes}; };
+    for (const auto key : touchedKeys(state.failed, *changes, failureSpan)) {
+        const auto it = state.failed.find(key);
+        if (it == state.failed.end()) continue;
+        const auto around = leaseAround(it->second.base, it->second.base + it->second.bytes);
+        if (!around) return false;
+        if (!sameRun(it->second, importRun(*around, it->first))) state.failed.erase(it);
+    }
+    for (const auto key : touchedKeys(state.failedJoins, *changes, failureSpan)) {
+        const auto it = state.failedJoins.find(key);
+        if (it == state.failedJoins.end()) continue;
+        const auto around = leaseAround(it->second.base, it->second.base + it->second.bytes);
+        if (!around) return false;
+        if (!sameRun(it->second, joinedRun(*around, it->second.base, it->second.base + it->second.bytes))) state.failedJoins.erase(it);
+    }
+    if (watchSerial != state.refreshedWatchSerial) {
+        ++counters.watchPasses;
+        for (const auto& [base, entry] : state.imports) {
+            if (entry.unwatched && GuestMemory::Watched(base, static_cast<std::size_t>(entry.bytes))) {
+                GuestMemory::Unwatch(base, entry.bytes);
+                state.unwatchedNotes.emplace_back(base, entry.bytes);
+            }
+        }
+    }
+    state.refreshedWatchSerial = watchSerial;
+    state.refreshedGeneration = reached;
+    ++counters.incremental;
+    ++reconcileTotals().incremental;
+    return true;
+}
+
 // Drops imports whose registered range changed or disappeared: their pages may no longer back the
-// guest addresses. Walks the imports only when the registry changed since the last walk.
-void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
+// guest addresses. Walks the imports only when the registry changed since the last walk, and then
+// only those a change touched when the change log reaches back (refreshImportsIncrementally).
+// `complete` says whether `lease` is the whole registry; a partial one (leaseAround) never serves
+// the walk, which then takes a full lease itself.
+void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, bool complete = true) {
     if (state.device != context.device) {
         ++state.mapVersion;
         while (!state.imports.empty()) {
@@ -933,25 +1131,30 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (state.freeMemory == nullptr) state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
+    if (refreshImportsIncrementally(context, state)) return;
+    GuestAllocations::Lease whole;
+    if (!complete) {
+        whole = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        ++localImportReconcile().fullLeases;
+        ++reconcileTotals().wholeLeases;
+    }
+    const auto& walked = complete ? lease : whole;
+    ++localImportReconcile().full;
+    ++reconcileTotals().full;
+    // Read before the walk: a coverage change during it is seen by the next reconcile.
+    state.refreshedWatchSerial = GuestMemory::UnwatchSerial();
     state.refreshedGeneration = generation;
+    // Pulled now so the next reconcile can start from this generation.
+    pullRegistryChanges(state);
     for (auto it = state.imports.begin(); it != state.imports.end();) {
-        const auto* range = leasedRangeAt(lease, it->first);
-        if (range != nullptr && sameRange(it->second, lease)) {
-            if (it->second.unwatched && GuestMemory::Watched(it->first, static_cast<std::size_t>(it->second.bytes))) {
-                GuestMemory::Unwatch(it->first, it->second.bytes);
-                state.unwatchedNotes.emplace_back(it->first, it->second.bytes);
-            }
-            ++it;
-            continue;
-        }
-        static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
-        if (trace && range != nullptr && range->bytes == it->second.bytes) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
         const auto next = std::next(it);
-        retireImport(context.device, state, it, lease);
+        reconcileImport(context, state, it, walked);
         it = next;
     }
-    for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRun(it->second, importRun(lease, it->first)) ? std::next(it) : state.failed.erase(it);
-    for (auto it = state.failedJoins.begin(); it != state.failedJoins.end();) it = sameRun(it->second, joinedRun(lease, it->second.base, it->second.base + it->second.bytes)) ? std::next(it) : state.failedJoins.erase(it);
+    for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRun(it->second, importRun(walked, it->first)) ? std::next(it) : state.failed.erase(it);
+    for (auto it = state.failedJoins.begin(); it != state.failedJoins.end();) it = sameRun(it->second, joinedRun(walked, it->second.base, it->second.base + it->second.bytes)) ? std::next(it) : state.failedJoins.erase(it);
+    state.refreshedWindow = importWindow.load(std::memory_order_relaxed);
+    state.refreshedUnaliased = state.unaliasedSpans.size();
 }
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
@@ -2150,7 +2353,17 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
             ++lookups.hits;
             hit->lastUseFrame = frame;
             result = hit;
-        } else if (const auto known = state.uncoveredMisses.find({address, address + bytes}); !stale && known != state.uncoveredMisses.end() && known->second.first == state.refreshedGeneration && known->second.second == state.mapVersion) {
+        } else if (const auto known = state.uncoveredMisses.find({address, address + bytes}); known != state.uncoveredMisses.end() && ((!stale && known->second.first == state.refreshedGeneration && known->second.second == state.mapVersion) || [&] {
+                       // Still not covered by one registered run when no registry change since the
+                       // miss touched the range (the run around it is unchanged), and still served by
+                       // no import: the slow path would find the same (a reconcile only retires).
+                       if (!incrementalImports() || findImport(state, address, address + bytes) != nullptr) return false;
+                       const auto changes = registryChangesSince(state, known->second.first);
+                       if (!changes || touchedByChanges(*changes, address, address + bytes)) return false;
+                       known->second.first = state.changesTo;
+                       ++localImportReconcile().rememberedByLog;
+                       return true;
+                   }())) {
             ++lookups.remembered;
         } else {
             const auto slowStarted = std::chrono::steady_clock::now();
@@ -2158,8 +2371,24 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
             else if (state.device != context.device) ++lookups.staleDevice;
             else ++lookups.staleGeneration;
             const auto generationBefore = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-            refreshImports(context, state, lease);
+            // The ranges around the address serve the lookup and the import unless making it would
+            // retire another import, whose shadowed results are only placed right against the whole
+            // registry (retireImport); then, or without the change log, the full lease as before.
+            auto around = incrementalImports() ? leaseAround(address, address + bytes) : std::nullopt;
+            GuestAllocations::Lease lease;
+            if (around) lease = std::move(*around);
+            else {
+                lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+                ++localImportReconcile().fullLeases;
+                ++reconcileTotals().wholeLeases;
+            }
+            const bool complete = !around.has_value();
+            refreshImports(context, state, lease, complete);
+            if (!complete && wouldRetireImport(state, importRun(lease, address))) {
+                lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+                ++localImportReconcile().fullLeases;
+                ++reconcileTotals().wholeLeases;
+            }
             if (runCovers(lease, address, address + bytes)) {
                 const auto* entry = importAllocation(context, state, address, lease);
                 if (entry != nullptr) entry->lastUseFrame = frame;
@@ -2182,6 +2411,9 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
             if (now - lookups.window >= std::chrono::seconds(10)) {
                 const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
                 std::fprintf(stderr, "[local-import-lookups] 10 s: %llu HostImportFor calls, %llu fast hits, slow: %llu registry changed, %llu device changed, %llu not imported yet (%llu not covered by one registered run, %llu import refused); %llu remembered misses; %.1f ms in slow paths; registry generation advanced %llu; %zu imports\n", static_cast<unsigned long long>(lookups.calls), static_cast<unsigned long long>(lookups.hits), static_cast<unsigned long long>(lookups.staleGeneration), static_cast<unsigned long long>(lookups.staleDevice), static_cast<unsigned long long>(lookups.misses), static_cast<unsigned long long>(lookups.uncovered), static_cast<unsigned long long>(lookups.importFailed), static_cast<unsigned long long>(lookups.remembered), lookups.slowMs, static_cast<unsigned long long>(generation - lookups.generationAtWindow), state.imports.size());
+                auto& reconcile = localImportReconcile();
+                std::fprintf(stderr, "[local-import-reconcile] 10 s: %llu incremental (%llu imports checked, %llu retired), %llu full walks (%llu without the change log, %llu after a run-setting change), %llu coverage re-checks; leases: %llu around a range, %llu whole registry; %llu misses remembered across registry changes\n", static_cast<unsigned long long>(reconcile.incremental), static_cast<unsigned long long>(reconcile.checked), static_cast<unsigned long long>(reconcile.retired), static_cast<unsigned long long>(reconcile.full), static_cast<unsigned long long>(reconcile.fullNoLog), static_cast<unsigned long long>(reconcile.fullSettings), static_cast<unsigned long long>(reconcile.watchPasses), static_cast<unsigned long long>(reconcile.smallLeases), static_cast<unsigned long long>(reconcile.fullLeases), static_cast<unsigned long long>(reconcile.rememberedByLog));
+                reconcile = LocalImportReconcile{};
                 lookups = LocalImportLookups{};
                 lookups.generationAtWindow = generation;
 #ifdef _WIN32
@@ -2209,6 +2441,11 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 }
 
 constexpr std::uint64_t IdleImportFrames = 60;
+
+HostImportReconcileTotals HostImportReconcileCounts() {
+    std::lock_guard lock(Imports().mutex);
+    return reconcileTotals();
+}
 
 std::size_t RetireIdleImports(const Context& context) {
     if (context.hostImportAlignment == 0) return 0;
@@ -2241,10 +2478,8 @@ const HostImport* ExistingHostImport(const Context& context, std::uint64_t addre
     bool notes = false;
     {
         std::lock_guard lock(state.mutex);
-        if (importsStale(context, state)) {
-            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-            refreshImports(context, state, lease);
-        }
+        // A reconcile takes the whole registry only when the change log cannot serve it.
+        if (importsStale(context, state)) refreshImports(context, state, {}, false);
         result = findImport(state, address, address + bytes);
         notes = !state.unwatchedNotes.empty();
     }
@@ -4118,7 +4353,7 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     std::lock_guard lock(state.mutex);
     // An import whose registered range changed must not be reused: reconcile first, as an upload
     // does (the walk only runs when the registry changed since the last one).
-    if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) static_cast<void>(refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix()));
+    if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) refreshImports(context, state, {}, false);
     auto found = state.imports.upper_bound(address);
     if (found == state.imports.begin()) return 0;
     --found;

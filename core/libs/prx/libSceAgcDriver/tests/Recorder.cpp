@@ -2744,6 +2744,106 @@ bool writtenBufferOrderTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+// The registry's change log and the lease around a range (libc), and the imports' reconcile that
+// uses them: an import survives a change elsewhere through an incremental reconcile, and is retired
+// when a neighbor registered next to it continues its run (the change touches the import's span).
+bool hostImportReconcileTests(const Device& device) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: import reconcile not tested\n";
+        return false;
+    }
+    const auto piece = static_cast<std::size_t>(std::max<VkDeviceSize>(1u << 20u, context.hostImportAlignment));
+    // One allocation of four pieces: the import's range, its neighbor, an unregistered gap and an
+    // unrelated range (separate allocations may land next to each other and continue the run).
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, 4 * piece, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(piece, 4 * piece);
+#endif
+    Require(block != nullptr, "cannot allocate the import reconcile block");
+    auto* second = static_cast<std::byte*>(block) + piece;
+    auto* distant = static_cast<std::byte*>(block) + 3 * piece;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::vector<void*> registered;
+    struct Cleanup {
+        std::vector<void*>& registered;
+        void* block;
+        ~Cleanup() {
+            for (auto* pointer : registered) {
+                try {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(pointer);
+                } catch (...) {
+                }
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } cleanup{registered, block};
+    const auto add = [&](void* pointer, std::size_t bytes) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(pointer, bytes, true, true, true);
+        registered.push_back(pointer);
+    };
+
+    // The change log names a registration after the generation it starts from, and nothing after its own.
+    const auto before = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    add(block, piece);
+    std::array<std::uint64_t, 3 * 64> triples{};
+    std::size_t count = 0;
+    const auto reached = GuestAllocations::GuestAllocationsChangedSince_nid_postfix(before, triples.data(), 64, &count);
+    Require(count != SIZE_MAX && count >= 1 && reached > before, "the registry's change log lost a registration");
+    bool logged = false;
+    for (std::size_t i = 0; i < count; ++i) logged = logged || (triples[3 * i] > before && triples[3 * i + 1] == address && triples[3 * i + 2] == address + piece);
+    Require(logged, "the registry's change log does not name the registered range");
+    Require(GuestAllocations::GuestAllocationsChangedSince_nid_postfix(reached, triples.data(), 64, &count) == reached && count == 0, "the registry's change log reports changes after the newest generation");
+    Require(GuestAllocations::GuestAllocationsChangedSince_nid_postfix(before, triples.data(), 0, &count) == reached && count == SIZE_MAX, "a too small change log read was not refused");
+
+    const HostImport* imported = nullptr;
+    {
+        std::lock_guard gpu(GpuMutex());
+        imported = HostImportFor(context, address, piece);
+    }
+    if (imported == nullptr) {
+        std::cout << "host import refused: import reconcile not tested\n";
+        return false;
+    }
+    const auto totals = HostImportReconcileCounts();
+    add(distant, piece);
+    {
+        std::lock_guard gpu(GpuMutex());
+        Require(HostImportFor(context, address, piece) == imported, "an import was dropped for a registration elsewhere");
+    }
+    const bool incremental = std::getenv("APS5_NO_INCREMENTAL_IMPORTS") == nullptr;
+    if (incremental) Require(HostImportReconcileCounts().incremental > totals.incremental && HostImportReconcileCounts().full == totals.full, "a registration elsewhere took a whole walk of the imports");
+
+    // The lease around a range holds the ranges that continue its run, not the unrelated one.
+    add(second, piece);
+    bool complete = false;
+    const auto around = GuestAllocations::GuestAllocationsAcquireAround_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::uintptr_t>(address + 1), 16, &complete);
+    Require(complete && around.size() == 2 && around[0]->address == address && around[1]->address == address + piece, "the lease around a range misses the range continuing its run");
+    const auto distantAround = GuestAllocations::GuestAllocationsAcquireAround_nid_postfix(reinterpret_cast<std::uintptr_t>(distant), reinterpret_cast<std::uintptr_t>(distant) + 1, 16, &complete);
+    Require(complete && distantAround.size() == 1 && distantAround[0]->address == reinterpret_cast<std::uint64_t>(distant), "the lease around a range holds more than its run");
+    static_cast<void>(GuestAllocations::GuestAllocationsAcquireAround_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::uintptr_t>(address + 1), 1, &complete));
+    Require(!complete, "a lease around a range over its limit was not refused");
+
+    // The neighbor continues the import's run: the reconcile retires the import, as a whole walk does,
+    // and the range is imported again as one run with it.
+    const HostImport* joined = nullptr;
+    {
+        std::lock_guard gpu(GpuMutex());
+        joined = HostImportFor(context, address, piece);
+    }
+    Require(joined != nullptr && joined->base == address, "the range lost its import after a neighbor was registered");
+    Require(joined->bytes == 2 * piece, "a neighbor that continues an import's run left the import standing");
+    std::cout << "host import reconcile: ok\n";
+    return true;
+}
+
 void hostImportUnmapTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -5884,6 +5984,10 @@ int main(int argc, char** argv) {
             if (!writtenBufferOrderTests(device, recorder)) return 77;
             std::cout << "written buffer order tests passed\n";
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--host-import-reconcile-only") {
+            gpu.unlock();
+            return hostImportReconcileTests(device) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-unmap-only") {
             gpu.unlock();
