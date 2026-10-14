@@ -95,6 +95,7 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
 // hook-free readers and a build's stage A.
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+bool AnyFreshShadowOverlaps(std::uint64_t address, std::size_t bytes);
 
 // The sources of a storage upload's surface-relative runs: [begin, end) pieces of them, each read
 // from one buffer (a slab while the unit is fresh, else the import) at `offset` (byte x of the run

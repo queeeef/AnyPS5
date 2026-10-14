@@ -505,6 +505,46 @@ bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
     });
 }
 
+bool AnyFreshShadowOverlaps(std::uint64_t address, std::size_t bytes) {
+    if (!UnitShadowEnabled() || bytes == 0) return false;
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "a shadow freshness query outside the device lock");
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    auto& registry = Registry();
+    std::vector<std::shared_ptr<UnitShadow>> shadows;
+    {
+        std::lock_guard lock(registry.mutex);
+        shadows = overlapping(registry, address, end);
+    }
+    for (const auto& shadow : shadows) {
+        const auto begin = std::max(address, shadow->importBase);
+        const auto stop = std::min(end, shadow->ImportEnd());
+        if (stop <= begin) continue;
+        const auto first = shadow->UnitOf(begin);
+        const auto last = shadow->UnitOf(stop - 1);
+        std::uint64_t walkFirst = last + 1, walkLast = first;
+        {
+            std::lock_guard lock(registry.mutex);
+            for (auto unit = first; unit <= last; ++unit) {
+                if (!shadow->Live(unit)) continue;
+                walkFirst = std::min(walkFirst, unit);
+                walkLast = std::max(walkLast, unit);
+            }
+        }
+        if (walkFirst > walkLast) continue;
+        const auto walkBegin = std::max(shadow->UnitBegin(walkFirst), shadow->importBase);
+        const auto walkEnd = std::min(shadow->UnitBegin(walkLast + 1), shadow->ImportEnd());
+        if (walkEnd > walkBegin) GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+        std::lock_guard lock(registry.mutex);
+        std::vector<std::uint8_t> changed, cpu;
+        changedUnits(*shadow, walkFirst, walkLast, changed, cpu);
+        for (auto unit = walkFirst; unit <= walkLast; ++unit) {
+            if (!shadow->Live(unit) || changed[static_cast<std::size_t>(unit - walkFirst)] == GuestMemory::BlockWritten) continue;
+            if (shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())] != nullptr) return true;
+        }
+    }
+    return false;
+}
+
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (!UnitShadowEnabled()) return false;
     for (const auto& [begin, end] : ranges) {

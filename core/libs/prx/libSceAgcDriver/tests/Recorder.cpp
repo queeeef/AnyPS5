@@ -2410,6 +2410,9 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(!AnyShadowedOverlaps(unit3, unit) && AnyShadowedOverlaps(unit4, unit), "the partial publish copied the wrong unit");
     recorder.Sync();
     Require(words[3 * unit] == 0x33 && words[4 * unit - 1] == 0x33 && words[4 * unit] == 0x11, "the partial publish's bytes are wrong");
+    Require(!AnyFreshShadowOverlaps(unit3, unit) && AnyFreshShadowOverlaps(unit4, unit) && AnyFreshShadowOverlaps(unit3, static_cast<std::size_t>(2 * unit)), "a unit's freshness is misjudged after a partial publish");
+    MarkWritten(unit4 + 128, 64);
+    Require(AnyShadowedOverlaps(unit4, unit) && !AnyFreshShadowOverlaps(unit4, unit), "a unit stamped by a driver write after its retile still counts as holding the newest bytes");
     // A CPU write into a page of unit 4 makes it stale: the publish collects the unit itself (no
     // walk saw the store before it), copies nothing and drops it.
     static_cast<void>(CollectWritesUncached(unit4, unit));

@@ -94,6 +94,26 @@ ProofCounters& Proofs() {
     return counters;
 }
 
+struct ShadowedKeyCounters {
+    std::atomic<std::uint64_t> syncs{0};
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> staleShadows{0};
+    std::atomic<std::uint64_t> freshShadows{0};
+};
+
+ShadowedKeyCounters& ShadowedKeys() {
+    static ShadowedKeyCounters counters;
+    return counters;
+}
+
+bool ShadowHoldsKeys(std::uint64_t begin, std::size_t count) {
+    if (!AnyShadowedOverlaps(begin, count)) return false;
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return true;
+    const bool fresh = AnyFreshShadowOverlaps(begin, count);
+    (fresh ? ShadowedKeys().freshShadows : ShadowedKeys().staleShadows).fetch_add(1, std::memory_order_relaxed);
+    return fresh;
+}
+
 bool ScanProfileEnabled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
@@ -110,7 +130,7 @@ void ReportScans(std::chrono::steady_clock::time_point now) {
     }
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto& proofs = Proofs();
-    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()));
+    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable; shadowed keys (cumulative): %llu synced, %llu read without a wait, prediction over %llu stale and %llu fresh shadows\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(ShadowedKeys().syncs.load()), static_cast<unsigned long long>(ShadowedKeys().skipped.load()), static_cast<unsigned long long>(ShadowedKeys().staleShadows.load()), static_cast<unsigned long long>(ShadowedKeys().freshShadows.load()));
 }
 
 void CountScan(std::size_t bytes, std::chrono::steady_clock::time_point start) {
@@ -442,9 +462,12 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             return DccKeys::Mixed;
         }
         PublishShadow(metaAddress, count, PublishScope::Whole, PublishReason::Keys);
-        if (auto* recorder = Recorder::Active()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             Recorder::CountSync(2);
-            recorder->Sync();
+            ShadowedKeys().syncs.fetch_add(1, std::memory_order_relaxed);
+            recorder->SyncThrough(metaAddress, count);
+        } else {
+            ShadowedKeys().skipped.fetch_add(1, std::memory_order_relaxed);
         }
     }
     const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
@@ -700,7 +723,7 @@ DccKeys EncodedKeys(const GuestTextureResource& resource, DccKeys keys) {
 }
 
 std::optional<PendingFillOutcome> PendingFills(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || ShadowHoldsKeys(begin, count)) return std::nullopt;
     auto writes = recorder.PendingWritesOver(begin, count);
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
