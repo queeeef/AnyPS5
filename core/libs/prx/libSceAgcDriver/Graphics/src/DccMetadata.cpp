@@ -461,8 +461,9 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             memoized = true;
             return DccKeys::Mixed;
         }
+        const bool fresh = AnyFreshShadowOverlaps(metaAddress, count);
         PublishShadow(metaAddress, count, PublishScope::Whole, PublishReason::Keys);
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
+        if (auto* recorder = Recorder::Active(); fresh && recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             Recorder::CountSync(2);
             ShadowedKeys().syncs.fetch_add(1, std::memory_order_relaxed);
             recorder->SyncThrough(metaAddress, count);

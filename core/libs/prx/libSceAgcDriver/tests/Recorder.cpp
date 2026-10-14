@@ -2413,6 +2413,9 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(!AnyFreshShadowOverlaps(unit3, unit) && AnyFreshShadowOverlaps(unit4, unit) && AnyFreshShadowOverlaps(unit3, static_cast<std::size_t>(2 * unit)), "a unit's freshness is misjudged after a partial publish");
     MarkWritten(unit4 + 128, 64);
     Require(AnyShadowedOverlaps(unit4, unit) && !AnyFreshShadowOverlaps(unit4, unit), "a unit stamped by a driver write after its retile still counts as holding the newest bytes");
+    recorder.NotePendingWrite(unit4, 16);
+    Require(ReadDccKeys(unit4, 16u * 256u) == ReadDccKeys(address + 2 * unit, 16u * 256u) && recorder.Recording(), "keys under a stale shadow were not read as the import's bytes without a sync");
+    recorder.Sync();
     // A CPU write into a page of unit 4 makes it stale: the publish collects the unit itself (no
     // walk saw the store before it), copies nothing and drops it.
     static_cast<void>(CollectWritesUncached(unit4, unit));
