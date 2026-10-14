@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <intrin.h>
 #include "prx/libc/include/FaultDebuggerShared.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -27,6 +28,15 @@ struct LocalArenaCounters {
     std::uint64_t handledWrites = 0;
     std::uint64_t drained = 0;
     std::uint64_t hostOpens = 0;
+    std::uint64_t collectTicks = 0;
+    std::uint64_t armTicks = 0;
+};
+
+struct LocalArenaTicks {
+    std::uint64_t& total;
+    std::uint64_t started = __rdtsc();
+    explicit LocalArenaTicks(std::uint64_t& total) : total(total) {}
+    ~LocalArenaTicks() { total += __rdtsc() - started; }
 };
 
 inline thread_local LocalArenaCounters localArenaCounters;
@@ -310,6 +320,7 @@ public:
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
         ++localArenaCounters.collects;
+        const LocalArenaTicks collectTicks(localArenaCounters.collectTicks);
         std::lock_guard lock(mutex);
         drainFaults();
         const auto capacity = *count;
@@ -376,6 +387,7 @@ public:
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
                         markFault(alias, other.protection == PAGE_EXECUTE_READWRITE ? FaultDebugger::ArmedExecuteReadWrite : FaultDebugger::ArmedReadWrite);
                         ++localArenaCounters.armProtects;
+                        const LocalArenaTicks armTicks(localArenaCounters.armTicks);
                         if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
                         other.armed = true;
                     }

@@ -1099,7 +1099,39 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
-std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
+void localNoteCollectCaller(const void* caller, std::size_t bytes) {
+    static std::mutex mutex;
+    static std::unordered_map<std::uintptr_t, std::pair<std::uint64_t, std::uint64_t>> callers;
+    static auto window = std::chrono::steady_clock::now();
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!enabled) return;
+    std::lock_guard lock(mutex);
+    auto& entry = callers[reinterpret_cast<std::uintptr_t>(caller)];
+    ++entry.first;
+    entry.second += bytes;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds(10)) return;
+    window = now;
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&localNoteCollectCaller), &module);
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+#else
+    const std::uintptr_t base = 0;
+#endif
+    std::vector<std::pair<std::uintptr_t, std::pair<std::uint64_t, std::uint64_t>>> hot(callers.begin(), callers.end());
+    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    std::string line = "[local-collect-callers] 10 s walks by caller (driver offset: walks/MiB):";
+    for (std::size_t i = 0; i < hot.size() && i < 16; ++i) {
+        char text[96];
+        std::snprintf(text, sizeof(text), " +0x%llx:%llu/%.1f", static_cast<unsigned long long>(hot[i].first - base), static_cast<unsigned long long>(hot[i].second.first), hot[i].second.second / 1048576.0);
+        line += text;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    callers.clear();
+}
+
+std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, const void* caller = nullptr) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -1137,6 +1169,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
+    localNoteCollectCaller(caller, bytes);
 #ifndef _WIN32
     if (useMemo && threadCollectEpoch != 0 && bytes <= WriteBlockBytes) {
         const auto begin = first & ~(WriteBlockBytes - 1);
@@ -1160,11 +1193,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 }
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, true);
+    return collectWrites(address, bytes, true, __builtin_return_address(0));
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, false);
+    return collectWrites(address, bytes, false, __builtin_return_address(0));
 }
 
 void BumpCollectEpoch() {

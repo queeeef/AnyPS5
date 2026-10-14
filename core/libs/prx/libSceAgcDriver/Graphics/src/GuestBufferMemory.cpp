@@ -2184,11 +2184,13 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
                 lookups = LocalImportLookups{};
                 lookups.generationAtWindow = generation;
 #ifdef _WIN32
-                std::uint64_t arena[6]{};
-                GuestArena::GuestArenaThreadCounters_nid_postfix(arena, 6);
-                static thread_local std::uint64_t previous[6]{};
-                std::fprintf(stderr, "[local-arena-thread] thread %lu 10 s: %llu write-watch collects, %llu VirtualQuery, %llu VirtualProtect re-arms, %llu write faults handled here, %llu debugger-resolved faults drained, %llu host-write opens\n", static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(arena[0] - previous[0]), static_cast<unsigned long long>(arena[1] - previous[1]), static_cast<unsigned long long>(arena[2] - previous[2]), static_cast<unsigned long long>(arena[3] - previous[3]), static_cast<unsigned long long>(arena[4] - previous[4]), static_cast<unsigned long long>(arena[5] - previous[5]));
-                for (int i = 0; i < 6; ++i) previous[i] = arena[i];
+                std::uint64_t arena[9]{};
+                GuestArena::GuestArenaThreadCounters_nid_postfix(arena, 9);
+                static thread_local std::uint64_t previous[9]{};
+                const double windowTicks = previous[8] != 0 ? static_cast<double>(arena[8] - previous[8]) : 0.0;
+                const auto share = [&](int i) { return windowTicks > 0 ? 100.0 * static_cast<double>(arena[i] - previous[i]) / windowTicks : 0.0; };
+                std::fprintf(stderr, "[local-arena-thread] thread %lu 10 s: %llu write-watch collects (%.1f%% of the window inside them), %llu VirtualQuery, %llu VirtualProtect re-arms (%.1f%% inside them), %llu write faults handled here, %llu debugger-resolved faults drained, %llu host-write opens\n", static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(arena[0] - previous[0]), share(6), static_cast<unsigned long long>(arena[1] - previous[1]), static_cast<unsigned long long>(arena[2] - previous[2]), share(7), static_cast<unsigned long long>(arena[3] - previous[3]), static_cast<unsigned long long>(arena[4] - previous[4]), static_cast<unsigned long long>(arena[5] - previous[5]));
+                for (int i = 0; i < 9; ++i) previous[i] = arena[i];
 #endif
             }
         }

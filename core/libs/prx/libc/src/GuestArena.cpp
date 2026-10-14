@@ -322,7 +322,7 @@ bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
 }
 
 void GuestArenaThreadCounters_nid_postfix(std::uint64_t* counters, std::size_t count) {
-    const std::uint64_t values[] = {localArenaCounters.collects, localArenaCounters.queries, localArenaCounters.armProtects, localArenaCounters.handledWrites, localArenaCounters.drained, localArenaCounters.hostOpens};
+    const std::uint64_t values[] = {localArenaCounters.collects, localArenaCounters.queries, localArenaCounters.armProtects, localArenaCounters.handledWrites, localArenaCounters.drained, localArenaCounters.hostOpens, localArenaCounters.collectTicks, localArenaCounters.armTicks, __rdtsc()};
     for (std::size_t i = 0; i < count && i < std::size(values); ++i) counters[i] = values[i];
 }
 
