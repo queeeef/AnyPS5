@@ -1190,6 +1190,8 @@ Recorder::~Recorder() {
         context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     }
     spare.clear();
+    for (auto& prologue : sparePrologues) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &prologue);
+    sparePrologues.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
     sparePools.clear();
     // Sync() above waited for every batch, so no submission still signals the timeline.
@@ -1409,6 +1411,28 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
     return {commands, false, !elide};
+}
+
+VkCommandBuffer Recorder::PrologueCommands() {
+    ensureOpen();
+    if (open->prologue != VK_NULL_HANDLE) return open->prologue;
+    VkCommandBuffer prologue = VK_NULL_HANDLE;
+    if (!sparePrologues.empty()) {
+        prologue = sparePrologues.back();
+        sparePrologues.pop_back();
+    } else {
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = context.pool;
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &prologue), "vkAllocateCommandBuffers recorder prologue");
+    }
+    open->prologue = prologue;
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(prologue, &begin), "vkBeginCommandBuffer recorder prologue");
+    recordBarrier(prologue, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    return prologue;
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
@@ -3204,8 +3228,16 @@ void Recorder::Submit() {
     auto batch = std::move(open);
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submission.commandBufferCount = 1;
-    submission.pCommandBuffers = &batch->commands;
+    const std::array<VkCommandBuffer, 2> buffers{batch->prologue, batch->commands};
+    if (batch->prologue != VK_NULL_HANDLE) {
+        recordBarrier(batch->prologue, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->prologue), "vkEndCommandBuffer recorder prologue");
+        submission.commandBufferCount = 2;
+        submission.pCommandBuffers = buffers.data();
+    } else {
+        submission.commandBufferCount = 1;
+        submission.pCommandBuffers = &batch->commands;
+    }
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size() + batch->readSets.size(), batch->writes.size());
@@ -3765,6 +3797,18 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    if (batch.prologue != VK_NULL_HANDLE) {
+        bool kept = false;
+        if (sparePrologues.size() < 64) {
+            try {
+                sparePrologues.push_back(batch.prologue);
+                kept = true;
+            } catch (...) {
+            }
+        }
+        if (!kept) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &batch.prologue);
+        batch.prologue = VK_NULL_HANDLE;
+    }
     if (batch.queries != VK_NULL_HANDLE) {
         if (!GpuTimingEnabled() && sparePools.size() < 64) {
             try {

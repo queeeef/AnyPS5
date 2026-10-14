@@ -66,6 +66,8 @@ public:
         bool barrier = true;
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    VkCommandBuffer PrologueCommands();
+    std::uint64_t OpenBatchSerial() const { return submissions + 1; }
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -520,6 +522,7 @@ public:
 private:
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkCommandBuffer prologue = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
@@ -802,6 +805,7 @@ private:
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
+    std::vector<VkCommandBuffer> sparePrologues;
     std::vector<VkQueryPool> sparePools;
     mutable std::mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;

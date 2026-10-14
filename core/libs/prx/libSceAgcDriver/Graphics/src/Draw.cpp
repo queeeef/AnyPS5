@@ -984,6 +984,8 @@ struct DrawInputs {
     };
     std::vector<InPlaceVertexRange> inPlaceVertexRanges;
     std::vector<std::int32_t> vertexRangeOf;
+    std::uint64_t inPlaceIndexBegin = 0;
+    std::size_t inPlaceIndexBytes = 0;
     bool vertexInputBehindGpuWrite = false;
     std::set<std::uint32_t> fragmentOutputs;
     VkPipelineStageFlags shaderStages = 0;
@@ -1116,6 +1118,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.indexHandle = import->buffer;
             inputs.indexOffset = draw.indexAddress - import->base;
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
+            inputs.inPlaceIndexBegin = draw.indexAddress;
+            inputs.inPlaceIndexBytes = static_cast<std::size_t>(indexBytes);
         } else {
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
@@ -1675,108 +1679,181 @@ std::uint64_t LocalPassTimingKey(const State& state) {
     return key;
 }
 
-struct LocalVertexMirror {
-    std::shared_ptr<DeviceBuffer> buffer;
-    std::uint64_t generation = 0;
+constexpr std::uint64_t LocalMirrorChunkBytes = 2ull << 20u;
+constexpr std::uint64_t LocalMirrorPageBytes = 4096;
+constexpr std::size_t LocalMirrorPages = static_cast<std::size_t>(LocalMirrorChunkBytes / LocalMirrorPageBytes);
+
+struct LocalMirrorChunk {
+    std::uint64_t base = 0;
+    const Recorder* owner = nullptr;
+    std::shared_ptr<DeviceBuffer> device;
+    std::vector<std::byte> host;
+    std::vector<std::uint8_t> valid;
+    std::vector<std::uint64_t> generation;
+    std::vector<std::uint64_t> checkedEpoch;
     std::uint64_t lastUse = 0;
 };
 
-struct LocalVertexMirrorUse {
-    std::size_t range;
-    std::shared_ptr<DeviceBuffer> buffer;
-    bool copy;
-    std::uint64_t generation;
-};
-
-struct LocalVertexMirrors {
+struct LocalMirrors {
     std::mutex mutex;
-    std::map<std::pair<std::uint64_t, std::size_t>, LocalVertexMirror> entries;
-    std::uint64_t bytes = 0;
-    std::uint64_t uses = 0;
-    std::uint64_t hits = 0;
-    std::uint64_t copies = 0;
-    std::uint64_t copiedBytes = 0;
-    std::uint64_t pending = 0;
-    std::uint64_t shadowed = 0;
-    std::uint64_t unwatched = 0;
-    std::uint64_t evicted = 0;
+    std::unordered_map<std::uint64_t, std::shared_ptr<LocalMirrorChunk>> chunks;
     std::uint64_t serial = 0;
+    std::uint64_t ranges = 0;
+    std::uint64_t vertexServed = 0;
+    std::uint64_t indexServed = 0;
+    std::uint64_t pagesChecked = 0;
+    std::uint64_t pagesCompared = 0;
+    std::uint64_t pagesWatched = 0;
+    std::uint64_t pagesRefreshed = 0;
+    std::uint64_t pendingFallbacks = 0;
+    std::uint64_t shadowFallbacks = 0;
+    std::uint64_t spanFallbacks = 0;
+    std::uint64_t ownerFallbacks = 0;
+    std::uint64_t evicted = 0;
+    double validateMs = 0;
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 
-LocalVertexMirrors& localVertexMirrors() {
-    static LocalVertexMirrors mirrors;
+LocalMirrors& localMirrors() {
+    static LocalMirrors mirrors;
     return mirrors;
 }
 
-std::vector<LocalVertexMirrorUse> LocalMirrorVertexInputs(const Context& context, Recorder& recorder, const DrawInputs& inputs) {
-    static const bool enabled = std::getenv("APS5_LOCAL_VERTEX_MIRROR") != nullptr;
+bool localMirrorRange(const Context& context, Recorder& recorder, LocalMirrors& mirrors, std::uint64_t begin, std::size_t bytes, VkBuffer& handle, VkDeviceSize& offset) {
+    ++mirrors.ranges;
+    const auto chunkBase = begin & ~(LocalMirrorChunkBytes - 1u);
+    const auto firstPage = (begin - chunkBase) / LocalMirrorPageBytes;
+    const auto endPage = (begin + bytes - chunkBase + LocalMirrorPageBytes - 1u) / LocalMirrorPageBytes;
+    if (bytes == 0 || endPage > LocalMirrorPages || !GuestMemory::Accessible(reinterpret_cast<const void*>(chunkBase + firstPage * LocalMirrorPageBytes), static_cast<std::size_t>((endPage - firstPage) * LocalMirrorPageBytes))) {
+        ++mirrors.spanFallbacks;
+        return false;
+    }
+    if (recorder.PendingWriteOverlaps(begin, bytes)) {
+        ++mirrors.pendingFallbacks;
+        return false;
+    }
+    if (AnyShadowedOverlaps(begin, bytes)) {
+        ++mirrors.shadowFallbacks;
+        return false;
+    }
+    auto& slot = mirrors.chunks[chunkBase];
+    if (slot == nullptr) {
+        slot = std::make_shared<LocalMirrorChunk>();
+        slot->base = chunkBase;
+        slot->owner = &recorder;
+        slot->device = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(LocalMirrorChunkBytes), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        slot->host.resize(static_cast<std::size_t>(LocalMirrorChunkBytes));
+        slot->valid.assign(LocalMirrorPages, 0);
+        slot->generation.assign(LocalMirrorPages, 0);
+        slot->checkedEpoch.assign(LocalMirrorPages, 0);
+    }
+    auto chunk = slot;
+    if (chunk->owner != &recorder) {
+        ++mirrors.ownerFallbacks;
+        return false;
+    }
+    chunk->lastUse = ++mirrors.serial;
+    const auto epoch = GuestMemory::CollectEpoch();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> refreshes;
+    for (auto page = firstPage; page < endPage; ++page) {
+        const auto address = chunkBase + page * LocalMirrorPageBytes;
+        auto* held = chunk->host.data() + page * LocalMirrorPageBytes;
+        const bool watched = GuestMemory::Watched(address, static_cast<std::size_t>(LocalMirrorPageBytes));
+        ++mirrors.pagesChecked;
+        bool current = false;
+        if (chunk->valid[page] != 0) {
+            if (watched) {
+                ++mirrors.pagesWatched;
+                GuestMemory::CollectWrites(address, static_cast<std::size_t>(LocalMirrorPageBytes));
+                current = chunk->generation[page] != 0 && GuestMemory::UnchangedSince(address, static_cast<std::size_t>(LocalMirrorPageBytes), chunk->generation[page]);
+            } else if (chunk->checkedEpoch[page] == epoch) {
+                current = true;
+            } else {
+                ++mirrors.pagesCompared;
+                current = std::memcmp(held, reinterpret_cast<const void*>(address), static_cast<std::size_t>(LocalMirrorPageBytes)) == 0;
+            }
+        }
+        if (!current) {
+            chunk->generation[page] = watched ? GuestMemory::CollectWrites(address, static_cast<std::size_t>(LocalMirrorPageBytes)) : 0;
+            GuestMemory::Read(address, std::span<std::byte>(held, static_cast<std::size_t>(LocalMirrorPageBytes)), 1);
+            chunk->valid[page] = 1;
+            ++mirrors.pagesRefreshed;
+            const auto at = page * LocalMirrorPageBytes;
+            if (!refreshes.empty() && refreshes.back().first + refreshes.back().second == at) refreshes.back().second += LocalMirrorPageBytes;
+            else refreshes.emplace_back(at, LocalMirrorPageBytes);
+        }
+        chunk->checkedEpoch[page] = epoch;
+    }
+    if (!refreshes.empty()) {
+        std::uint64_t total = 0;
+        for (const auto& refresh : refreshes) total += refresh.second;
+        auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(total), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::vector<VkBufferCopy> regions;
+        regions.reserve(refreshes.size());
+        std::uint64_t at = 0;
+        for (const auto& [chunkOffset, length] : refreshes) {
+            std::memcpy(staging->Bytes().data() + at, chunk->host.data() + chunkOffset, static_cast<std::size_t>(length));
+            regions.push_back({at, chunkOffset, length});
+            at += length;
+        }
+        const auto prologue = recorder.PrologueCommands();
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(prologue, staging->Handle(), chunk->device->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        recorder.Keep(staging);
+    }
+    recorder.Keep(chunk);
+    handle = chunk->device->Handle();
+    offset = begin - chunkBase;
+    return true;
+}
+
+void LocalMirrorDrawInputs(const Context& context, Recorder& recorder, const State& state, DrawInputs& inputs) {
+    static const bool enabled = std::getenv("APS5_LOCAL_DRAW_MIRROR") != nullptr;
     static const std::uint64_t budget = [] {
-        const char* value = std::getenv("APS5_LOCAL_VERTEX_MIRROR_MIB");
-        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 2048ull) << 20u;
+        const char* value = std::getenv("APS5_LOCAL_DRAW_MIRROR_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ull) << 20u;
     }();
-    std::vector<LocalVertexMirrorUse> uses;
-    if (!enabled || inputs.inPlaceVertexRanges.empty()) return uses;
-    auto& mirrors = localVertexMirrors();
+    if (!enabled || state.stages.mesh) return;
+    if (inputs.inPlaceVertexRanges.empty() && inputs.inPlaceIndexBytes == 0) return;
+    auto& mirrors = localMirrors();
     std::lock_guard lock(mirrors.mutex);
+    const auto started = std::chrono::steady_clock::now();
     for (std::size_t r = 0; r < inputs.inPlaceVertexRanges.size(); ++r) {
         const auto& range = inputs.inPlaceVertexRanges[r];
-        ++mirrors.uses;
-        if (recorder.PendingWriteOverlaps(range.begin, range.bytes)) {
-            ++mirrors.pending;
-            continue;
+        VkBuffer handle = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        if (!localMirrorRange(context, recorder, mirrors, range.begin, range.bytes, handle, offset)) continue;
+        ++mirrors.vertexServed;
+        for (std::size_t i = 0; i < inputs.vertexRangeOf.size(); ++i) {
+            if (inputs.vertexRangeOf[i] != static_cast<std::int32_t>(r)) continue;
+            inputs.vertexHandles[i] = handle;
+            inputs.vertexOffsets[i] = inputs.vertexOffsets[i] - range.importOffset + offset;
         }
-        if (AnyShadowedOverlaps(range.begin, range.bytes)) {
-            ++mirrors.shadowed;
-            continue;
-        }
-        const auto generation = GuestMemory::CollectWrites(range.begin, range.bytes);
-        if (generation == 0) {
-            ++mirrors.unwatched;
-            continue;
-        }
-        auto& entry = mirrors.entries[{range.begin, range.bytes}];
-        entry.lastUse = ++mirrors.serial;
-        if (entry.buffer != nullptr && entry.generation != 0 && GuestMemory::UnchangedSince(range.begin, range.bytes, entry.generation)) {
-            ++mirrors.hits;
-            uses.push_back({r, entry.buffer, false, entry.generation});
-            continue;
-        }
-        if (entry.buffer == nullptr) {
-            entry.buffer = std::make_shared<DeviceBuffer>(context, range.bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            mirrors.bytes += range.bytes;
-        }
-        entry.generation = 0;
-        ++mirrors.copies;
-        mirrors.copiedBytes += range.bytes;
-        uses.push_back({r, entry.buffer, true, generation});
     }
-    while (mirrors.bytes > budget && !mirrors.entries.empty()) {
-        auto oldest = mirrors.entries.begin();
-        for (auto it = mirrors.entries.begin(); it != mirrors.entries.end(); ++it) {
-            if (it->second.lastUse < oldest->second.lastUse) oldest = it;
+    if (inputs.inPlaceIndexBytes != 0) {
+        VkBuffer handle = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        if (localMirrorRange(context, recorder, mirrors, inputs.inPlaceIndexBegin, inputs.inPlaceIndexBytes, handle, offset)) {
+            ++mirrors.indexServed;
+            inputs.indexHandle = handle;
+            inputs.indexOffset = offset;
         }
-        mirrors.bytes -= oldest->first.second;
-        mirrors.entries.erase(oldest);
+    }
+    while (mirrors.chunks.size() * LocalMirrorChunkBytes > budget) {
+        auto oldest = mirrors.chunks.begin();
+        for (auto it = mirrors.chunks.begin(); it != mirrors.chunks.end(); ++it) {
+            if (it->second->lastUse < oldest->second->lastUse) oldest = it;
+        }
+        mirrors.chunks.erase(oldest);
         ++mirrors.evicted;
     }
     const auto now = std::chrono::steady_clock::now();
+    mirrors.validateMs += std::chrono::duration<double, std::milli>(now - started).count();
     if (now - mirrors.window >= std::chrono::seconds(10)) {
         mirrors.window = now;
-        std::fprintf(stderr, "[local-vertex-mirror] 10 s: %llu in-place ranges, %llu served from VRAM, %llu copied (%.1f MiB), left in place: %llu behind pending GPU writes, %llu shadowed, %llu unwatched; %zu mirrors hold %.1f MiB, %llu evicted\n", static_cast<unsigned long long>(mirrors.uses), static_cast<unsigned long long>(mirrors.hits), static_cast<unsigned long long>(mirrors.copies), mirrors.copiedBytes / 1048576.0, static_cast<unsigned long long>(mirrors.pending), static_cast<unsigned long long>(mirrors.shadowed), static_cast<unsigned long long>(mirrors.unwatched), mirrors.entries.size(), mirrors.bytes / 1048576.0, static_cast<unsigned long long>(mirrors.evicted));
-        mirrors.uses = mirrors.hits = mirrors.copies = mirrors.copiedBytes = mirrors.pending = mirrors.shadowed = mirrors.unwatched = mirrors.evicted = 0;
-    }
-    return uses;
-}
-
-void LocalCommitVertexMirrors(const std::vector<LocalVertexMirrorUse>& uses, const DrawInputs& inputs) {
-    auto& mirrors = localVertexMirrors();
-    std::lock_guard lock(mirrors.mutex);
-    for (const auto& use : uses) {
-        if (!use.copy) continue;
-        const auto& range = inputs.inPlaceVertexRanges[use.range];
-        auto found = mirrors.entries.find({range.begin, range.bytes});
-        if (found != mirrors.entries.end() && found->second.buffer == use.buffer) found->second.generation = use.generation;
+        std::fprintf(stderr, "[local-draw-mirror] 10 s: %llu ranges, served from VRAM: %llu vertex, %llu index; pages: %llu checked, %llu compared, %llu watched, %llu refreshed (%.1f MiB); left in place: %llu behind pending GPU writes, %llu shadowed, %llu outside a chunk, %llu other queue; %zu chunks (%.0f MiB), %llu evicted; %.1f ms on the worker\n", static_cast<unsigned long long>(mirrors.ranges), static_cast<unsigned long long>(mirrors.vertexServed), static_cast<unsigned long long>(mirrors.indexServed), static_cast<unsigned long long>(mirrors.pagesChecked), static_cast<unsigned long long>(mirrors.pagesCompared), static_cast<unsigned long long>(mirrors.pagesWatched), static_cast<unsigned long long>(mirrors.pagesRefreshed), mirrors.pagesRefreshed * LocalMirrorPageBytes / 1048576.0, static_cast<unsigned long long>(mirrors.pendingFallbacks), static_cast<unsigned long long>(mirrors.shadowFallbacks), static_cast<unsigned long long>(mirrors.spanFallbacks), static_cast<unsigned long long>(mirrors.ownerFallbacks), mirrors.chunks.size(), mirrors.chunks.size() * LocalMirrorChunkBytes / 1048576.0, static_cast<unsigned long long>(mirrors.evicted), mirrors.validateMs);
+        mirrors.ranges = mirrors.vertexServed = mirrors.indexServed = mirrors.pagesChecked = mirrors.pagesCompared = mirrors.pagesWatched = mirrors.pagesRefreshed = 0;
+        mirrors.pendingFallbacks = mirrors.shadowFallbacks = mirrors.spanFallbacks = mirrors.ownerFallbacks = mirrors.evicted = 0;
+        mirrors.validateMs = 0;
     }
 }
 
@@ -1900,18 +1977,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto mirrorUses = LocalMirrorVertexInputs(context, *recorder, inputs);
-    const bool mirrorCopies = std::any_of(mirrorUses.begin(), mirrorUses.end(), [](const LocalVertexMirrorUse& use) { return use.copy; });
-    for (const auto& use : mirrorUses) {
-        const auto& range = inputs.inPlaceVertexRanges[use.range];
-        for (std::size_t i = 0; i < inputs.vertexRangeOf.size(); ++i) {
-            if (inputs.vertexRangeOf[i] != static_cast<std::int32_t>(use.range)) continue;
-            inputs.vertexHandles[i] = use.buffer->Handle();
-            inputs.vertexOffsets[i] -= range.importOffset;
-        }
-        recorder->Keep(use.buffer);
-    }
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || mirrorCopies, fenced, passAccess);
+    LocalMirrorDrawInputs(context, *recorder, state, inputs);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
@@ -1957,17 +2024,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (inputs.vertexInputBehindGpuWrite) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
             countBarrier(1);
-        }
-        if (mirrorCopies) {
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-            for (const auto& use : mirrorUses) {
-                if (!use.copy) continue;
-                const auto& range = inputs.inPlaceVertexRanges[use.range];
-                CopyBuffer(context, commands, range.importBuffer, range.importOffset, use.buffer->Handle(), 0, range.bytes);
-            }
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
-            countBarrier(2);
-            LocalCommitVertexMirrors(mirrorUses, inputs);
         }
         if (meshIndirect) {
             meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
