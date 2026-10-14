@@ -1704,6 +1704,7 @@ struct LocalMirrors {
     std::uint64_t pagesChecked = 0;
     std::uint64_t pagesCompared = 0;
     std::uint64_t pagesWatched = 0;
+    std::uint64_t rangeCollects = 0;
     std::uint64_t pagesRefreshed = 0;
     std::uint64_t pendingFallbacks = 0;
     std::uint64_t shadowFallbacks = 0;
@@ -1755,16 +1756,28 @@ bool localMirrorRange(const Context& context, Recorder& recorder, LocalMirrors& 
     chunk->lastUse = ++mirrors.serial;
     const auto epoch = GuestMemory::CollectEpoch();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> refreshes;
+    const auto rangeAddress = chunkBase + firstPage * LocalMirrorPageBytes;
+    const auto rangeBytes = static_cast<std::size_t>((endPage - firstPage) * LocalMirrorPageBytes);
+    const bool allWatched = GuestMemory::Watched(rangeAddress, rangeBytes);
+    std::uint64_t rangeGeneration = 0;
+    if (allWatched) {
+        bool collected = true;
+        for (auto page = firstPage; page < endPage && collected; ++page) collected = chunk->checkedEpoch[page] == epoch;
+        if (!collected) {
+            rangeGeneration = GuestMemory::CollectWrites(rangeAddress, rangeBytes);
+            ++mirrors.rangeCollects;
+        }
+    }
     for (auto page = firstPage; page < endPage; ++page) {
         const auto address = chunkBase + page * LocalMirrorPageBytes;
         auto* held = chunk->host.data() + page * LocalMirrorPageBytes;
-        const bool watched = GuestMemory::Watched(address, static_cast<std::size_t>(LocalMirrorPageBytes));
+        const bool watched = allWatched || GuestMemory::Watched(address, static_cast<std::size_t>(LocalMirrorPageBytes));
         ++mirrors.pagesChecked;
         bool current = false;
         if (chunk->valid[page] != 0) {
             if (watched) {
                 ++mirrors.pagesWatched;
-                GuestMemory::CollectWrites(address, static_cast<std::size_t>(LocalMirrorPageBytes));
+                if (!allWatched && chunk->checkedEpoch[page] != epoch) GuestMemory::CollectWrites(address, static_cast<std::size_t>(LocalMirrorPageBytes));
                 current = chunk->generation[page] != 0 && GuestMemory::UnchangedSince(address, static_cast<std::size_t>(LocalMirrorPageBytes), chunk->generation[page]);
             } else if (chunk->checkedEpoch[page] == epoch) {
                 current = true;
@@ -1774,7 +1787,7 @@ bool localMirrorRange(const Context& context, Recorder& recorder, LocalMirrors& 
             }
         }
         if (!current) {
-            chunk->generation[page] = watched ? GuestMemory::CollectWrites(address, static_cast<std::size_t>(LocalMirrorPageBytes)) : 0;
+            chunk->generation[page] = !watched ? 0 : rangeGeneration != 0 ? rangeGeneration : GuestMemory::CollectWrites(address, static_cast<std::size_t>(LocalMirrorPageBytes));
             GuestMemory::Read(address, std::span<std::byte>(held, static_cast<std::size_t>(LocalMirrorPageBytes)), 1);
             chunk->valid[page] = 1;
             ++mirrors.pagesRefreshed;
@@ -1850,8 +1863,8 @@ void LocalMirrorDrawInputs(const Context& context, Recorder& recorder, const Sta
     mirrors.validateMs += std::chrono::duration<double, std::milli>(now - started).count();
     if (now - mirrors.window >= std::chrono::seconds(10)) {
         mirrors.window = now;
-        std::fprintf(stderr, "[local-draw-mirror] 10 s: %llu ranges, served from VRAM: %llu vertex, %llu index; pages: %llu checked, %llu compared, %llu watched, %llu refreshed (%.1f MiB); left in place: %llu behind pending GPU writes, %llu shadowed, %llu outside a chunk, %llu other queue; %zu chunks (%.0f MiB), %llu evicted; %.1f ms on the worker\n", static_cast<unsigned long long>(mirrors.ranges), static_cast<unsigned long long>(mirrors.vertexServed), static_cast<unsigned long long>(mirrors.indexServed), static_cast<unsigned long long>(mirrors.pagesChecked), static_cast<unsigned long long>(mirrors.pagesCompared), static_cast<unsigned long long>(mirrors.pagesWatched), static_cast<unsigned long long>(mirrors.pagesRefreshed), mirrors.pagesRefreshed * LocalMirrorPageBytes / 1048576.0, static_cast<unsigned long long>(mirrors.pendingFallbacks), static_cast<unsigned long long>(mirrors.shadowFallbacks), static_cast<unsigned long long>(mirrors.spanFallbacks), static_cast<unsigned long long>(mirrors.ownerFallbacks), mirrors.chunks.size(), mirrors.chunks.size() * LocalMirrorChunkBytes / 1048576.0, static_cast<unsigned long long>(mirrors.evicted), mirrors.validateMs);
-        mirrors.ranges = mirrors.vertexServed = mirrors.indexServed = mirrors.pagesChecked = mirrors.pagesCompared = mirrors.pagesWatched = mirrors.pagesRefreshed = 0;
+        std::fprintf(stderr, "[local-draw-mirror] 10 s: %llu ranges, served from VRAM: %llu vertex, %llu index; pages: %llu checked, %llu compared, %llu watched, %llu range collects, %llu refreshed (%.1f MiB); left in place: %llu behind pending GPU writes, %llu shadowed, %llu outside a chunk, %llu other queue; %zu chunks (%.0f MiB), %llu evicted; %.1f ms on the worker\n", static_cast<unsigned long long>(mirrors.ranges), static_cast<unsigned long long>(mirrors.vertexServed), static_cast<unsigned long long>(mirrors.indexServed), static_cast<unsigned long long>(mirrors.pagesChecked), static_cast<unsigned long long>(mirrors.pagesCompared), static_cast<unsigned long long>(mirrors.pagesWatched), static_cast<unsigned long long>(mirrors.rangeCollects), static_cast<unsigned long long>(mirrors.pagesRefreshed), mirrors.pagesRefreshed * LocalMirrorPageBytes / 1048576.0, static_cast<unsigned long long>(mirrors.pendingFallbacks), static_cast<unsigned long long>(mirrors.shadowFallbacks), static_cast<unsigned long long>(mirrors.spanFallbacks), static_cast<unsigned long long>(mirrors.ownerFallbacks), mirrors.chunks.size(), mirrors.chunks.size() * LocalMirrorChunkBytes / 1048576.0, static_cast<unsigned long long>(mirrors.evicted), mirrors.validateMs);
+        mirrors.ranges = mirrors.vertexServed = mirrors.indexServed = mirrors.pagesChecked = mirrors.pagesCompared = mirrors.pagesWatched = mirrors.rangeCollects = mirrors.pagesRefreshed = 0;
         mirrors.pendingFallbacks = mirrors.shadowFallbacks = mirrors.spanFallbacks = mirrors.ownerFallbacks = mirrors.evicted = 0;
         mirrors.validateMs = 0;
     }
