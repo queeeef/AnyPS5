@@ -1,7 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include <chrono>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -21,6 +25,25 @@ void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, co
     if (result.instanceOffsetSgpr >= 0) parameters.firstInstance = drawUserWord(program, result.instanceOffsetSgpr);
 }
 
+namespace {
+
+void NoteNonVertexIndirect(const std::string& reason) {
+    static std::mutex mutex;
+    static std::map<std::string, std::uint64_t> counts;
+    static auto window = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    ++counts[reason];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds(10)) return;
+    std::string line = "[local-indirect-nonvertex] 10 s:";
+    for (const auto& [name, count] : counts) line += " " + name + " " + std::to_string(count) + ";";
+    std::fprintf(stderr, "%s\n", line.c_str());
+    counts.clear();
+    window = now;
+}
+
+}
+
 std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect) {
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     auto& indirect = *drawParameters.indirect;
@@ -31,7 +54,24 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     constexpr std::uint32_t NoLocation = 0x280u;
     const bool meshPath = graphics.stages.mesh.has_value() && !graphics.stages.tessellation && !graphics.rectList;
     const bool meshGpuSide = meshPath && drawParameters.indexed && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
-    if ((graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList) && !meshGpuSide) fail(Path::NonVertexPath);
+    if ((graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList) && !meshGpuSide) {
+        fail(Path::NonVertexPath);
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) {
+            const char* paths[] = {"vertex", "geometry", "tessellation", "tessellation+geometry"};
+            std::string reason = graphics.rectList ? "rect list" : std::string(paths[static_cast<int>(graphics.stages.path)]) + (graphics.stages.mesh.has_value() ? " (mesh stages" + std::string(graphics.stages.tessellation ? ", tessellated)" : ")") : "");
+            if (meshPath) {
+                if (!drawParameters.indexed) reason += ": mesh not indexed";
+                else if (indirect.count != 1) reason += ": mesh count " + std::string(indirect.count > 1 ? ">1" : "0");
+                else if (indirect.countIndirect) reason += ": mesh count from memory";
+                else if (indirect.baseVertexLocation != NoLocation) reason += ": mesh base-vertex location";
+                else if (indirect.startInstanceLocation != NoLocation) reason += ": mesh start-instance location";
+                else reason += ": mesh draw-index location";
+            }
+            reason += indirect.opcode == 0 ? "" : " op 0x" + [&] { char text[8]; std::snprintf(text, sizeof(text), "%x", indirect.opcode); return std::string(text); }();
+            NoteNonVertexIndirect(reason);
+        }
+    }
     if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) fail(Path::DrawIndex);
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap);

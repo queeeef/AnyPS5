@@ -3285,6 +3285,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         static std::mutex reasonsMutex;
         static std::uint64_t uploads = 0, noImport = 0, noImportBytes = 0, misaligned = 0, misalignedBytes = 0, snapshotOnly = 0, snapshotBytes = 0;
         static std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> outside;
+        static std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> outsideReasons;
         bool inImport = false;
         if (context.hostImportAlignment != 0) {
             auto& state = Imports();
@@ -3297,6 +3298,11 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         else {
             ++noImport;
             noImportBytes += bytes;
+            const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(region.begin), false);
+            const char* why = range == nullptr || region.begin < range->address ? "unregistered" : !range->gpu ? "not GPU-mapped" : !range->readable ? "not readable" : region.end > range->address + range->bytes ? "crosses its range's end" : context.hostImportAlignment == 0 ? "no host imports" : "registered, no import";
+            auto& reason = outsideReasons[why];
+            ++reason.first;
+            reason.second += bytes;
             auto& bucket = outside[region.begin >> 28u];
             ++bucket.first;
             bucket.second += bytes;
@@ -3306,6 +3312,8 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
             // sparse, APS5_CPU_COPIES, no recorder, or an import gone by UploadFinish.
             AgcDriver::ProfilePrint_nid_no_patch("[buffers] %llu copied regions on the CPU: %llu snapshots (%.0f MiB), %llu misaligned in imports (%.0f MiB), %llu outside imports (%.0f MiB):", static_cast<unsigned long long>(uploads), static_cast<unsigned long long>(snapshotOnly), snapshotBytes / 1048576.0, static_cast<unsigned long long>(misaligned), misalignedBytes / 1048576.0, static_cast<unsigned long long>(noImport), noImportBytes / 1048576.0);
             for (const auto& [granule, counts] : outside) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx0000000:%llu/%.0fMiB", static_cast<unsigned long long>(granule), static_cast<unsigned long long>(counts.first), counts.second / 1048576.0);
+            AgcDriver::ProfilePrint_nid_no_patch("; outside imports because:");
+            for (const auto& [why, counts] : outsideReasons) AgcDriver::ProfilePrint_nid_no_patch(" %s %llu/%.0fMiB", why.c_str(), static_cast<unsigned long long>(counts.first), counts.second / 1048576.0);
             AgcDriver::ProfilePrint_nid_no_patch("\n");
         }
     }
