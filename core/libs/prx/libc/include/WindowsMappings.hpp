@@ -483,6 +483,12 @@ private:
 
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
+            // A clean range was collected from views that were not PAGE_NOACCESS, and a protection
+            // change or an unmap forgets it, so it is collectable without a lookup per page.
+            if (const auto next = cleanRanges.upper_bound(cursor); next != cleanRanges.begin() && cursor < std::prev(next)->second) {
+                cursor = std::min(end, std::prev(next)->second);
+                continue;
+            }
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = views.find(base); found != views.end()) {
                 if (found->second.protection == PAGE_NOACCESS) return false;
