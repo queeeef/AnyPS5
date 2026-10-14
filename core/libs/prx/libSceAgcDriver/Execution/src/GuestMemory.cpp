@@ -76,6 +76,13 @@ std::atomic<std::uint64_t> forgetCalls{0};
 std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+// The clean set (ThreadCollectMemo::clean): hits, ranges added after a walk, walks libc did not leave
+// clean, ranges dropped by the forget log, and drains that found the log overrun.
+std::atomic<std::uint64_t> cleanSetHits{0};
+std::atomic<std::uint64_t> cleanSetAdded{0};
+std::atomic<std::uint64_t> cleanSetRefused{0};
+std::atomic<std::uint64_t> cleanSetForgotten{0};
+std::atomic<std::uint64_t> cleanSetOverruns{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -308,6 +315,7 @@ public:
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" clean-set hits %llu added %llu refused %llu forgotten %llu overruns %llu", static_cast<unsigned long long>(cleanSetHits.load()), static_cast<unsigned long long>(cleanSetAdded.load()), static_cast<unsigned long long>(cleanSetRefused.load()), static_cast<unsigned long long>(cleanSetForgotten.load()), static_cast<unsigned long long>(cleanSetOverruns.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -1059,8 +1067,92 @@ struct ThreadCollectMemo {
         }
         covered.emplace(begin, end);
     }
+
+#ifdef _WIN32
+    // Ranges a walk of this thread left clean in libc's terms (every page a shared view, re-armed and
+    // not pinned, GuestArenaRangeClean), kept across epochs. libc logs every range it forgets as clean
+    // (a write fault, a host write, a pin, a protection change, an unmap); at the first collect of
+    // each epoch the thread drains the log since its last drain and drops what it names. A range still
+    // in the set was therefore not touched before this epoch's ordering point, and a walk of it would
+    // find nothing: libc skips its clean ranges. A write landing after the drain is seen by the next
+    // epoch, the rule the memo above already keeps. Private (GetWriteWatch) memory is never clean in
+    // libc, so it is always walked. APS5_NO_CLEAN_SET=1 turns the set off.
+    std::map<std::uintptr_t, std::uintptr_t> clean;
+    std::uint64_t cleanSerial = 0;
+    std::uint64_t cleanEpoch = 0;
+    std::uint64_t cleanUnwatched = 0;
+    std::vector<std::uintptr_t> forgotten;
+
+    static void eraseRange(std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t begin, std::uintptr_t end) {
+        auto it = ranges.lower_bound(begin);
+        if (it != ranges.begin() && std::prev(it)->second > begin) --it;
+        while (it != ranges.end() && it->first < end) {
+            const auto first = it->first;
+            const auto last = it->second;
+            it = ranges.erase(it);
+            if (first < begin) ranges.emplace(first, begin);
+            if (last > end) it = ranges.emplace(end, last).first;
+        }
+    }
+
+    void drainClean(std::uint64_t currentEpoch, std::uint64_t currentUnwatched) {
+        if (currentUnwatched != cleanUnwatched) {
+            clean.clear();
+            cleanUnwatched = currentUnwatched;
+        }
+        if (currentEpoch == cleanEpoch) return;
+        cleanEpoch = currentEpoch;
+        constexpr std::size_t capacity = 8192;
+        if (forgotten.empty()) forgotten.resize(2 * capacity);
+        std::size_t count = 0;
+        cleanSerial = GuestArena::GuestArenaForgottenClean_nid_postfix(cleanSerial, forgotten.data(), capacity, &count);
+        if (count == SIZE_MAX) {
+            if (!clean.empty()) cleanSetOverruns.fetch_add(1, std::memory_order_relaxed);
+            clean.clear();
+            return;
+        }
+        if (clean.empty()) return;
+        for (std::size_t i = 0; i < count; ++i) eraseRange(clean, forgotten[2 * i], forgotten[2 * i + 1]);
+        cleanSetForgotten.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    bool CleanCovers(std::uint64_t currentEpoch, std::uint64_t currentUnwatched, std::uintptr_t begin, std::uintptr_t end) {
+        drainClean(currentEpoch, currentUnwatched);
+        auto it = clean.upper_bound(begin);
+        if (it == clean.begin()) return false;
+        --it;
+        return it->first <= begin && end <= it->second;
+    }
+
+    // After a completed walk of [begin, end) in the current epoch (CleanCovers drained first).
+    void RememberClean(std::uintptr_t begin, std::uintptr_t end) {
+        if (!GuestArena::GuestArenaRangeClean_nid_postfix(begin, static_cast<std::size_t>(end - begin))) {
+            cleanSetRefused.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        cleanSetAdded.fetch_add(1, std::memory_order_relaxed);
+        if (clean.size() >= 16384) clean.clear();
+        auto it = clean.upper_bound(begin);
+        if (it != clean.begin() && std::prev(it)->second >= begin) --it;
+        while (it != clean.end() && it->first <= end) {
+            begin = std::min(begin, it->first);
+            end = std::max(end, it->second);
+            it = clean.erase(it);
+        }
+        clean.emplace(begin, end);
+    }
+#endif
 };
 thread_local ThreadCollectMemo threadCollectMemo;
+
+bool cleanSetEnabled() {
+#ifdef _WIN32
+    static const bool disabled = std::getenv("APS5_NO_CLEAN_SET") != nullptr;
+    return !disabled;
+#else
+    return false;
+#endif
+}
 
 bool sharedCollectMemo() {
     static const bool shared = std::getenv("APS5_SHARED_COLLECT_MEMO") != nullptr;
@@ -1187,6 +1279,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
+#ifdef _WIN32
+        // Like a memo entry, a clean entry exists only for a completed walk of an in-arena range.
+        if (cleanSetEnabled() && threadCollectMemo.CleanCovers(epoch, unwatched, first, stop)) {
+            cleanSetHits.fetch_add(1, std::memory_order_relaxed);
+            return tracker.generation.load(std::memory_order_relaxed);
+        }
+#endif
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1220,6 +1319,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         else {
             threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
             threadCollectMemo.Remember(epoch, serial, first, stop);
+#ifdef _WIN32
+            // The drain of CleanCovers ran before the walk under the same unwatch serial, so the log
+            // since then names any page forgotten after this proof.
+            if (useMemo && cleanSetEnabled() && serial == threadCollectMemo.cleanUnwatched && epoch == threadCollectMemo.cleanEpoch) threadCollectMemo.RememberClean(first, stop);
+#endif
         }
     }
     return tracker.generation;
@@ -1238,6 +1342,10 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t CollectCleanHits() {
+    return cleanSetHits.load(std::memory_order_relaxed);
 }
 
 std::uint64_t CollectEpochBumps() {

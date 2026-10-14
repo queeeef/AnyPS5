@@ -171,6 +171,53 @@ void partialCollect() {
     std::cout << "Partial shared write collection tests passed\n";
 }
 
+// A range a walk left clean is answered without a walk in later epochs, until a write, a protection
+// change or another thread's write is logged by libc; each such change is seen by the next epoch.
+void cleanSet() {
+#ifdef _WIN32
+    constexpr std::size_t page = 0x4000;
+    Mapping mapping(page * 4);
+    auto* data = static_cast<volatile std::byte*>(mapping.data);
+    const auto address = mapping.Address();
+    const auto size = mapping.size;
+    BumpCollectEpoch();
+    const auto first = CollectWrites(address, size);
+    require(first != 0, "clean set range is not watched");
+    const auto hits = CollectCleanHits();
+    BumpCollectEpoch();
+    const auto again = CollectWrites(address, size);
+    require(CollectCleanHits() > hits, "a clean range was walked again in a later epoch");
+    require(UnchangedSince(address, size, first) && again != 0, "an untouched clean range changed");
+    data[page * 2] = std::byte{7};
+    BumpCollectEpoch();
+    const auto written = CollectWrites(address, size);
+    require(!UnchangedSince(address, size, again), "a write after a clean proof was lost in the next epoch");
+    BumpCollectEpoch();
+    const auto settled = CollectWrites(address, size);
+    require(UnchangedSince(address, size, written) && settled != 0, "a collected write stayed dirty");
+    BumpCollectEpoch();
+    CollectWrites(address + page, page);
+    std::thread([&] { data[page] = std::byte{8}; }).join();
+    BumpCollectEpoch();
+    CollectWrites(address + page, page);
+    require(!UnchangedSince(address + page, page, settled), "another thread's write to a clean subrange was lost");
+    BumpCollectEpoch();
+    const auto beforeProtect = CollectWrites(address, size);
+    require(sceKernelMprotect(mapping.data, size, 3) == 0, "clean set protection change failed");
+    data[page * 3] = std::byte{9};
+    BumpCollectEpoch();
+    CollectWrites(address, size);
+    require(!UnchangedSince(address, size, beforeProtect), "a write after a protection change was lost");
+    BumpCollectEpoch();
+    const auto rearmed = CollectWrites(address, size);
+    data[0] = std::byte{10};
+    BumpCollectEpoch();
+    CollectWrites(address, size);
+    require(!UnchangedSince(address, size, rearmed), "a write after re-arming a reprotected range was lost");
+#endif
+    std::cout << "Clean set tests passed\n";
+}
+
 template<class TAction> void fails(TAction&& fn) {
     bool failed = false;
     try { fn(); } catch (const std::runtime_error&) { failed = true; }
@@ -267,6 +314,13 @@ int main(int argc, char** argv) {
                 return 77;
             }
             partialCollect();
+        }
+        else if (argc == 2 && std::string_view(argv[1]) == "--clean-set") {
+            if (!WriteWatched()) {
+                std::cout << "Clean set skipped: write tracking unavailable\n";
+                return 77;
+            }
+            cleanSet();
         }
         else if (argc == 2 && std::string_view(argv[1]) == "--benchmark") benchmark();
         else if (argc == 2 && std::string_view(argv[1]) == "--benchmark-labels") benchmark(true);

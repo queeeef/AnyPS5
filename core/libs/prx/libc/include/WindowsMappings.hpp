@@ -310,6 +310,40 @@ public:
         if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(base), 0)) fail("unmap shared guest alias");
     }
 
+    // The ranges forgotten as clean since `since` (a serial this returned before; 0 at first): every
+    // write fault, host write, pin, protection change and unmap forgets the clean ranges of its
+    // pages, so a range proven clean by Collect stays clean exactly until one of these is logged.
+    // Faults the debugger resolved are drained first. Returns the current serial; *count receives
+    // the number of [begin, end) pairs written to `ranges`, or SIZE_MAX when the log no longer holds
+    // everything since `since` or `capacity` is too small (the caller then forgets everything).
+    std::uint64_t Forgotten(std::uint64_t since, std::uintptr_t* ranges, std::size_t capacity, std::size_t* count) {
+        std::lock_guard lock(mutex);
+        drainFaults();
+        const auto pending = forgetSerial - std::min(since, forgetSerial);
+        if (since > forgetSerial || pending > forgetLog.size() || pending > capacity) {
+            *count = SIZE_MAX;
+            return forgetSerial;
+        }
+        for (auto serial = since; serial < forgetSerial; ++serial) {
+            const auto& entry = forgetLog[serial % forgetLog.size()];
+            ranges[2 * (serial - since)] = entry.first;
+            ranges[2 * (serial - since) + 1] = entry.second;
+        }
+        *count = static_cast<std::size_t>(pending);
+        return forgetSerial;
+    }
+
+    // Whether [address, address + bytes) lies in one clean range: Collect walked it, re-armed its
+    // shared pages, and nothing forgot it since.
+    bool Clean(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        drainFaults();
+        const auto next = cleanRanges.upper_bound(address);
+        if (next == cleanRanges.begin()) return false;
+        const auto clean = std::prev(next);
+        return clean->first <= address && address + bytes <= clean->second;
+    }
+
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
         std::lock_guard lock(mutex);
         const auto found = views.find(address & ~(pageBytes - 1));
@@ -486,6 +520,7 @@ private:
         std::uint8_t collected = 0;
     };
     void forgetClean(std::uintptr_t start, std::uintptr_t end) {
+        forgetLog[forgetSerial++ % forgetLog.size()] = {start, end};
         auto it = cleanRanges.lower_bound(start);
         if (it != cleanRanges.begin() && std::prev(it)->second > start) --it;
         while (it != cleanRanges.end() && it->first < end) {
@@ -636,6 +671,8 @@ private:
     }
 
     std::map<std::uintptr_t, std::uintptr_t> cleanRanges;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> forgetLog = std::vector<std::pair<std::uintptr_t, std::uintptr_t>>(std::size_t{1} << 16);
+    std::uint64_t forgetSerial = 0;
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
