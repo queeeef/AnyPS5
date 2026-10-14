@@ -34,6 +34,8 @@ struct Sampler {
     std::mutex mutex;
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> counts;
     std::uint64_t samples = 0;
+    std::uint64_t window = 0;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 
     ~Sampler() noexcept(false) {
         if (target != nullptr && !CloseHandle(target)) throw std::system_error(GetLastError(), std::system_category(), "Closing sampler thread handle");
@@ -48,7 +50,7 @@ struct Sampler {
         if (captured) {
             // Unwinding reads the target's stack while it is suspended; frames without unwind data
             // (JIT/guest code) end the walk.
-            for (int depth = 0; depth < 12 && context.Rip != 0; ++depth) {
+            for (int depth = 0; depth < 64 && context.Rip != 0; ++depth) {
                 frames.push_back(context.Rip);
                 DWORD64 imageBase = 0;
                 auto* entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
@@ -70,9 +72,9 @@ struct Sampler {
 
     void write() {
         std::lock_guard lock(mutex);
-        std::FILE* file = std::fopen(path.c_str(), "w");
+        std::FILE* file = std::fopen(path.c_str(), window == 0 ? "w" : "a");
         if (file == nullptr) return;
-        std::fprintf(file, "# %llu samples\n", static_cast<unsigned long long>(samples));
+        std::fprintf(file, "# window %llu at %.0f s: %llu samples\n", static_cast<unsigned long long>(window++), std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(), static_cast<unsigned long long>(samples));
         for (const auto& [address, count] : counts) {
             HMODULE module = nullptr;
             char name[MAX_PATH] = "?";
@@ -81,6 +83,8 @@ struct Sampler {
             std::fprintf(file, "%s 0x%llx %llu %llu\n", base ? base + 1 : name, static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(module)), static_cast<unsigned long long>(count.first), static_cast<unsigned long long>(count.second));
         }
         std::fclose(file);
+        counts.clear();
+        samples = 0;
     }
 };
 
