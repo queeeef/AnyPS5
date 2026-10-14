@@ -1853,7 +1853,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     const auto localDrawKey = LocalDrawGpuKey(state, draw, shaders, inputs, args != nullptr, record.pipeline->SplitsFaces(), record.pipeline->SplitsSecondChannel(), addressBased || resources.UsesAddressTable());
-    const auto localDrawTiming = localDrawKey != 0 ? recorder->BeginGpuTiming(localDrawKey) : Recorder::NoTiming;
+    static const bool localDrawStamps = std::getenv("APS5_PROFILE_DRAW_GPU_STAMPS") != nullptr;
+    const auto localDrawTiming = localDrawKey != 0 && localDrawStamps ? recorder->BeginGpuTiming(localDrawKey) : Recorder::NoTiming;
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state);
