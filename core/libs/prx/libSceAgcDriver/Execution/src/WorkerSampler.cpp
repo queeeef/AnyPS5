@@ -4,6 +4,7 @@
 #include <cstring>
 #ifdef _WIN32
 #include <windows.h>
+#include <intrin.h>
 #include <tlhelp32.h>
 #include <algorithm>
 #include <atomic>
@@ -50,6 +51,8 @@ struct Sampler {
     DWORD threadId = 0;
     std::uint64_t lastUser = 0;
     std::uint64_t lastKernel = 0;
+    ULONG64 lastCycles = 0;
+    std::uint64_t lastTsc = __rdtsc();
     std::chrono::steady_clock::time_point lastWrite = std::chrono::steady_clock::now();
 
     ~Sampler() noexcept(false) {
@@ -144,8 +147,14 @@ struct Sampler {
         const double kernelSeconds = static_cast<double>(kernel - lastKernel) / 1e7;
         lastUser = user;
         lastKernel = kernel;
+        ULONG64 cycles = 0;
+        QueryThreadCycleTime(target, &cycles);
+        const auto tsc = __rdtsc();
+        const double running = tsc > lastTsc ? 100.0 * static_cast<double>(cycles - lastCycles) / static_cast<double>(tsc - lastTsc) : 0.0;
+        lastCycles = cycles;
+        lastTsc = tsc;
         std::fprintf(file, "# window %llu at %.0f s: %llu samples; cpu %.2f s user + %.2f s kernel over %.1f s wall\n", static_cast<unsigned long long>(window), std::chrono::duration<double>(now - started).count(), static_cast<unsigned long long>(samples), userSeconds, kernelSeconds, wall);
-        if (queue != 0xffffffffu) std::fprintf(stderr, "[local-worker-cpu] queue 0x%x thread %lu window %llu: cpu %.2f s user + %.2f s kernel over %.1f s wall (%.0f%%), %llu samples\n", queue, static_cast<unsigned long>(threadId), static_cast<unsigned long long>(window), userSeconds, kernelSeconds, wall, wall > 0 ? 100.0 * (userSeconds + kernelSeconds) / wall : 0.0, static_cast<unsigned long long>(samples));
+        if (queue != 0xffffffffu) std::fprintf(stderr, "[local-worker-cpu] queue 0x%x thread %lu window %llu: cpu %.2f s user + %.2f s kernel over %.1f s wall (%.0f%%), running %.0f%% of the window by cycle count, %llu samples\n", queue, static_cast<unsigned long>(threadId), static_cast<unsigned long long>(window), userSeconds, kernelSeconds, wall, wall > 0 ? 100.0 * (userSeconds + kernelSeconds) / wall : 0.0, running, static_cast<unsigned long long>(samples));
         ++window;
         for (const auto& [address, count] : counts) {
             HMODULE module = nullptr;
@@ -289,16 +298,19 @@ void StartWorkerSampler(std::uint32_t queue) {
     sampler->path = std::string(path) + suffix;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
     sampler->lastUser = ThreadCpu100ns(sampler->target, sampler->lastKernel);
+    QueryThreadCycleTime(sampler->target, &sampler->lastCycles);
+    sampler->lastTsc = __rdtsc();
     std::lock_guard lock(workerSamplersMutex);
     workerSamplerThreads.emplace_back([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
         const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        static const bool cpuOnly = std::getenv("APS5_SAMPLE_WORKER_CPU_ONLY") != nullptr;
         while (!token.stop_requested()) {
             LARGE_INTEGER due{};
-            due.QuadPart = -10000;
+            due.QuadPart = cpuOnly ? -1000000 : -10000;
             if (timer != nullptr && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
-            else std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            sampler->sample();
+            else std::this_thread::sleep_for(std::chrono::milliseconds(cpuOnly ? 100 : 1));
+            if (!cpuOnly) sampler->sample();
             if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(10)) {
                 sampler->write();
                 flushed = std::chrono::steady_clock::now();
