@@ -109,6 +109,8 @@ struct ShadowedKeyCounters {
     std::atomic<std::uint64_t> skipped{0};
     std::atomic<std::uint64_t> staleShadows{0};
     std::atomic<std::uint64_t> freshShadows{0};
+    std::atomic<std::uint64_t> pendingPredicted{0};
+    std::atomic<std::uint64_t> pendingSynced{0};
 };
 
 ShadowedKeyCounters& ShadowedKeys() {
@@ -140,7 +142,7 @@ void ReportScans(std::chrono::steady_clock::time_point now) {
     }
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto& proofs = Proofs();
-    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable; shadowed keys (cumulative): %llu synced, %llu read without a wait, prediction over %llu stale and %llu fresh shadows\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(ShadowedKeys().syncs.load()), static_cast<unsigned long long>(ShadowedKeys().skipped.load()), static_cast<unsigned long long>(ShadowedKeys().staleShadows.load()), static_cast<unsigned long long>(ShadowedKeys().freshShadows.load()));
+    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable; shadowed keys (cumulative): %llu synced, %llu read without a wait, prediction over %llu stale and %llu fresh shadows; key reads over pending writes: %llu predicted, %llu waited\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(ShadowedKeys().syncs.load()), static_cast<unsigned long long>(ShadowedKeys().skipped.load()), static_cast<unsigned long long>(ShadowedKeys().staleShadows.load()), static_cast<unsigned long long>(ShadowedKeys().freshShadows.load()), static_cast<unsigned long long>(ShadowedKeys().pendingPredicted.load()), static_cast<unsigned long long>(ShadowedKeys().pendingSynced.load()));
 }
 
 void CountScan(std::size_t bytes, std::chrono::steady_clock::time_point start) {
@@ -455,6 +457,8 @@ namespace {
 
 // ReadDccKeys, saying in `memoized` whether the answer came from the pending-store memo rather
 // than the bytes.
+std::optional<DccKeys> PendingWriteKeys(std::uint64_t metaAddress, std::size_t count);
+
 DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized) {
     memoized = false;
     if (metaAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count)) return DccKeys::Unreadable;
@@ -479,6 +483,18 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             recorder->SyncThrough(metaAddress, count);
         } else {
             ShadowedKeys().skipped.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
+            if (const auto predicted = PendingWriteKeys(metaAddress, count)) {
+                ShadowedKeys().pendingPredicted.fetch_add(1, std::memory_order_relaxed);
+                memoized = true;
+                return *predicted;
+            }
+            Recorder::CountSync(2);
+            ShadowedKeys().pendingSynced.fetch_add(1, std::memory_order_relaxed);
+            recorder->SyncThrough(metaAddress, count);
         }
     }
     const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
@@ -716,14 +732,20 @@ DccKeys EncodedKeys(const GuestTextureResource& resource, DccKeys keys) {
     return keys;
 }
 
-bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count) {
-    const auto begin = resource.dccAddress;
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || ShadowHoldsKeys(begin, count)) return false;
+struct PendingFillOutcome {
+    int value;
+    bool mixed;
+    bool unknown;
+};
+
+std::optional<PendingFillOutcome> PendingFills(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || ShadowHoldsKeys(begin, count)) return std::nullopt;
     auto writes = recorder.PendingWritesOver(begin, count);
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
     int value = -1;
     bool mixed = false;
+    bool unknown = false;
     const auto see = [&](int key) {
         if (value < 0) value = key;
         else if (value != key) mixed = true;
@@ -743,6 +765,7 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
         }
         unwritten = std::move(rest);
         if (covered && write.value >= 0) see(write.value);
+        else if (covered) unknown = true;
     }
     for (const auto& [from, to] : unwritten) {
         if (mixed) break;
@@ -750,7 +773,23 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
         if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
         else mixed = true;
     }
-    return mixed || (value >= 0 && EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value))) == DccKeys::Uncompressed);
+    return PendingFillOutcome{value, mixed, unknown};
+}
+
+bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count) {
+    const auto outcome = PendingFills(recorder, resource.dccAddress, count);
+    if (!outcome) return false;
+    return outcome->mixed || (outcome->value >= 0 && EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(outcome->value))) == DccKeys::Uncompressed);
+}
+
+std::optional<DccKeys> PendingWriteKeys(std::uint64_t metaAddress, std::size_t count) {
+    const auto* recorder = Recorder::Active();
+    if (recorder == nullptr) return std::nullopt;
+    const auto outcome = PendingFills(*recorder, metaAddress, count);
+    if (!outcome || outcome->unknown) return std::nullopt;
+    if (outcome->mixed) return DccKeys::Mixed;
+    if (outcome->value < 0) return std::nullopt;
+    return ByteKeys(static_cast<std::uint8_t>(outcome->value));
 }
 
 }

@@ -4284,6 +4284,22 @@ void importWindowTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+void pendingKeyFillTests(Recorder& recorder) {
+    Require(Recorder::Active() == &recorder, "the test recorder is not the active one");
+    alignas(64) static std::array<std::uint8_t, 64> keys{};
+    keys.fill(0xff);
+    const auto address = reinterpret_cast<std::uint64_t>(keys.data());
+    const auto surfaceBytes = static_cast<std::uint64_t>(keys.size()) * 256u;
+    recorder.Sync();
+    Require(ReadDccKeys(address, surfaceBytes) == DccKeys::Uncompressed, "uncompressed key bytes did not read as uncompressed");
+    recorder.NotePendingFill(address, keys.size(), 0x00);
+    Require(ReadDccKeys(address, surfaceBytes) == DccKeys::Clear0000 && recorder.Recording(), "keys under a pending clear-code fill read as the stale bytes, or were waited for");
+    recorder.NotePendingFill(address, keys.size() / 2, 0x40);
+    Require(ReadDccKeys(address, surfaceBytes) == DccKeys::Mixed && recorder.Recording(), "keys under two pending fills of different values did not read as mixed without a wait");
+    recorder.NotePendingWrite(address, keys.size());
+    Require(ReadDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.Recording(), "keys under a pending write of unknown value were read without waiting for it");
+}
+
 void queuedWriteGroupTests() {
     using Write = Recorder::QueuedWrite;
     using Groups = std::vector<std::size_t>;
@@ -6590,6 +6606,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--parked-import-unmap-only") {
             gpu.unlock();
             parkedImportUnmapTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pending-key-fills-only") {
+            pendingKeyFillTests(recorder);
+            std::cout << "pending key fill tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unit-shadow-only") {
