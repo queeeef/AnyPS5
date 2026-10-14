@@ -704,8 +704,15 @@ std::uint64_t ForgetSerial() {
 
 std::atomic<std::uint64_t> frameSerialCounter{1};
 
+std::atomic<std::int64_t> frameSerialStartNs{0};
+
 void BumpFrameSerial() {
+    frameSerialStartNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
     frameSerialCounter.fetch_add(1, std::memory_order_release);
+}
+
+std::int64_t FrameSerialStartNs() {
+    return frameSerialStartNs.load(std::memory_order_relaxed);
 }
 
 std::uint64_t FrameSerial() {

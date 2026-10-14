@@ -199,6 +199,8 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 std::uint64_t ForgetSerial();
 void BumpFrameSerial();
 std::uint64_t FrameSerial();
+// steady_clock nanoseconds of the last BumpFrameSerial (the per-frame wait list's frame start).
+std::int64_t FrameSerialStartNs();
 
 // Attribution of guest memory accesses (the [hooksync] line in Recorder.cpp and the read-site
 // counts of the [guestmem] line, APS5_PROFILE_DRAW): a sync the flush hook makes for an access has

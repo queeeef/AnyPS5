@@ -3313,15 +3313,82 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     return result;
 }
 
+// WIP(local) APS5_PROFILE_WAIT_FRAMES=1: every real GPU wait of a frame, in order, one line per frame
+// ([local-wait-frame]): when in the frame it started, how long it waited, the kind (U timeline wait
+// with the mutex released, L fence wait under the mutex, S WaitSerial), the sync source (0 idle,
+// 1 pending write, 2 recorded store, 3 address-based, 4 other), the packet and read site, the batches
+// up to the target, the target's age since its submit, and six caller frames (driver offsets).
+struct LocalFrameWait {
+    double atMs = 0;
+    double ms = 0;
+    char kind = '?';
+    int source = 4;
+    std::uint32_t opcode = 0;
+    std::uint32_t queue = 0;
+    GuestMemory::ReadSite site = GuestMemory::ReadSite::Unknown;
+    std::size_t ahead = 0;
+    double ageMs = 0;
+    std::array<unsigned long long, 6> frames{};
+};
+
+bool LocalWaitFrames() {
+    static const bool enabled = std::getenv("APS5_PROFILE_WAIT_FRAMES") != nullptr;
+    return enabled;
+}
+
+void LocalNoteWait(char kind, int source, std::chrono::steady_clock::time_point started, double ms, std::size_t ahead, double ageMs) {
+    if (!LocalWaitFrames() || ms < 0.05) return;
+    static std::mutex mutex;
+    static std::vector<LocalFrameWait> waits;
+    static std::uint64_t frame = 0;
+    static std::int64_t frameStartNs = 0;
+    LocalFrameWait entry;
+    const auto packet = GuestMemory::CurrentPacket();
+    entry.kind = kind;
+    entry.source = source;
+    entry.opcode = packet.opcode;
+    entry.queue = packet.queue;
+    entry.site = GuestMemory::CurrentReadSite();
+    entry.ms = ms;
+    entry.ahead = ahead;
+    entry.ageMs = ageMs;
+    GuestMemory::CaptureCallerOffsets(entry.frames, 1);
+    std::lock_guard lock(mutex);
+    const auto current = GuestMemory::FrameSerial();
+    const auto currentStartNs = GuestMemory::FrameSerialStartNs();
+    if (current != frame) {
+        if (frame != 0 && !waits.empty()) {
+            double total = 0;
+            for (const auto& wait : waits) total += wait.ms;
+            std::string line;
+            char text[256];
+            std::snprintf(text, sizeof(text), "[local-wait-frame] frame %llu (+%llu) span %.1f ms: %zu waits %.1f ms:", static_cast<unsigned long long>(frame), static_cast<unsigned long long>(current - frame - 1), static_cast<double>(currentStartNs - frameStartNs) / 1e6, waits.size(), total);
+            line += text;
+            for (const auto& wait : waits) {
+                std::snprintf(text, sizeof(text), " [+%.1f %.2fms %c s%d q0x%x %s %s a%zu age%.1f @%llx/%llx/%llx/%llx/%llx/%llx]", wait.atMs, wait.ms, wait.kind, wait.source, wait.queue == GuestMemory::NoPacket ? 0xffu : wait.queue, wait.queue == GuestMemory::NoPacket ? "-" : PacketName(wait.opcode).c_str(), GuestMemory::ReadSiteName(wait.site), wait.ahead, wait.ageMs, wait.frames[0], wait.frames[1], wait.frames[2], wait.frames[3], wait.frames[4], wait.frames[5]);
+                line += text;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+        }
+        waits.clear();
+        frame = current;
+        frameStartNs = currentStartNs;
+    }
+    const auto startedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(started.time_since_epoch()).count();
+    entry.atMs = static_cast<double>(startedNs - frameStartNs) / 1e6;
+    if (waits.size() < 256) waits.push_back(entry);
+}
+
 }
 
 void Recorder::WaitSerial(std::uint64_t serial) {
     PerformanceTimer frameTiming("Recorder.WaitSerial");
     if (timeline == VK_NULL_HANDLE || serial == 0) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto start = profile || LocalWaitFrames() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
     const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
+    if (LocalWaitFrames()) LocalNoteWait('S', 4, start, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), 0, 0);
     if (profile) {
         unlockedWaits.fetch_add(1, std::memory_order_relaxed);
         unlockedWaitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
@@ -3529,7 +3596,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     // The site entry is taken under the mutex (the table is only touched under it; entries are
     // appended, never removed, so the index stays valid across the release).
     const RestoreSyncSite restoreSite{BeginSyncSite(source, site)};
-    const bool profile = DrawProfiled();
+    const bool profile = DrawProfiled() || LocalWaitFrames();
     const bool trace = TraceCapSync();
     const auto readSite = GuestMemory::CurrentReadSite();
     const auto newestSerial = submissions;
@@ -3566,6 +3633,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
+        if (LocalWaitFrames()) LocalNoteWait('U', source, start, std::chrono::duration<double, std::milli>(waited - start).count(), batchesToTarget, targetSubmittedAt != std::chrono::steady_clock::time_point{} ? std::chrono::duration<double, std::milli>(start - targetSubmittedAt).count() : -1.0);
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
     mutex.lock();
@@ -3676,7 +3744,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         const auto waitStart = std::chrono::steady_clock::now();
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
-        const bool signaledAtStart = !profile || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
+        const bool signaledAtStart = !(profile || LocalWaitFrames()) || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
         struct Report {
             bool enabled;
             int source;
@@ -3711,6 +3779,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
+        if (LocalWaitFrames() && !signaledAtStart) LocalNoteWait('L', source, waitStart, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count(), inFlight.size() + 1, std::chrono::duration<double, std::milli>(waitStart - batch->submittedAt).count());
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
