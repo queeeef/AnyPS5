@@ -182,6 +182,8 @@ struct HostImports {
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
     // reused while it is unchanged.
     std::uint64_t epoch = 1;
+    std::uint64_t mapVersion = 0;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::pair<std::uint64_t, std::uint64_t>> uncoveredMisses;
     VkDevice watchDevice = VK_NULL_HANDLE;
     bool unwatchImports = false;
     bool unwatchDmaBufImports = false;
@@ -248,6 +250,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
+    ++state.mapVersion;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return;
@@ -883,6 +886,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     state.liveBytes += bytes;
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "");
     entry.joined = joined;
+    ++state.mapVersion;
     return &state.imports.emplace(base, entry).first->second;
 }
 
@@ -904,6 +908,7 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
     if (state.device != context.device) {
+        ++state.mapVersion;
         while (!state.imports.empty()) {
             auto node = state.imports.extract(state.imports.begin());
             if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
@@ -1891,6 +1896,7 @@ void ClearHostImports(VkDevice device) {
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
     }
+    ++state.mapVersion;
     state.imports.clear();
     state.liveBytes = 0;
     state.failed.clear();
@@ -2111,6 +2117,9 @@ struct LocalImportLookups {
     std::uint64_t staleDevice = 0;
     std::uint64_t staleGeneration = 0;
     std::uint64_t misses = 0;
+    std::uint64_t uncovered = 0;
+    std::uint64_t importFailed = 0;
+    std::uint64_t remembered = 0;
     double slowMs = 0;
     std::uint64_t generationAtWindow = 0;
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
@@ -2140,20 +2149,30 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
             ++lookups.hits;
             hit->lastUseFrame = frame;
             result = hit;
+        } else if (const auto known = state.uncoveredMisses.find({address, address + bytes}); !stale && known != state.uncoveredMisses.end() && known->second.first == state.refreshedGeneration && known->second.second == state.mapVersion) {
+            ++lookups.remembered;
         } else {
             const auto slowStarted = std::chrono::steady_clock::now();
             if (!stale) ++lookups.misses;
             else if (state.device != context.device) ++lookups.staleDevice;
             else ++lookups.staleGeneration;
+            const auto generationBefore = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
             const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
             refreshImports(context, state, lease);
             if (runCovers(lease, address, address + bytes)) {
                 const auto* entry = importAllocation(context, state, address, lease);
                 if (entry != nullptr) entry->lastUseFrame = frame;
                 result = entry != nullptr && findImport(state, address, address + bytes) == entry ? entry : nullptr;
+                if (result == nullptr) ++lookups.importFailed;
             } else if (const auto* joined = findImport(state, address, address + bytes)) {
                 joined->lastUseFrame = frame;
                 result = joined;
+            } else {
+                ++lookups.uncovered;
+                if (generationBefore == state.refreshedGeneration && generationBefore == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+                    if (state.uncoveredMisses.size() >= 16384) state.uncoveredMisses.clear();
+                    state.uncoveredMisses[{address, address + bytes}] = {generationBefore, state.mapVersion};
+                }
             }
             lookups.slowMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slowStarted).count();
         }
@@ -2161,7 +2180,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
             const auto now = std::chrono::steady_clock::now();
             if (now - lookups.window >= std::chrono::seconds(10)) {
                 const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-                std::fprintf(stderr, "[local-import-lookups] 10 s: %llu HostImportFor calls, %llu fast hits, slow: %llu registry changed, %llu device changed, %llu not imported yet; %.1f ms in slow paths; registry generation advanced %llu; %zu imports\n", static_cast<unsigned long long>(lookups.calls), static_cast<unsigned long long>(lookups.hits), static_cast<unsigned long long>(lookups.staleGeneration), static_cast<unsigned long long>(lookups.staleDevice), static_cast<unsigned long long>(lookups.misses), lookups.slowMs, static_cast<unsigned long long>(generation - lookups.generationAtWindow), state.imports.size());
+                std::fprintf(stderr, "[local-import-lookups] 10 s: %llu HostImportFor calls, %llu fast hits, slow: %llu registry changed, %llu device changed, %llu not imported yet (%llu not covered by one registered run, %llu import refused); %llu remembered misses; %.1f ms in slow paths; registry generation advanced %llu; %zu imports\n", static_cast<unsigned long long>(lookups.calls), static_cast<unsigned long long>(lookups.hits), static_cast<unsigned long long>(lookups.staleGeneration), static_cast<unsigned long long>(lookups.staleDevice), static_cast<unsigned long long>(lookups.misses), static_cast<unsigned long long>(lookups.uncovered), static_cast<unsigned long long>(lookups.importFailed), static_cast<unsigned long long>(lookups.remembered), lookups.slowMs, static_cast<unsigned long long>(generation - lookups.generationAtWindow), state.imports.size());
                 lookups = LocalImportLookups{};
                 lookups.generationAtWindow = generation;
             }
