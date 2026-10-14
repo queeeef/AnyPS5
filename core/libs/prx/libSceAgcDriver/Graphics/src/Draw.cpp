@@ -1647,6 +1647,21 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     });
 }
 
+std::uint64_t LocalPassTimingKey(const State& state) {
+    static const bool enabled = std::getenv("APS5_PROFILE_PASS_TARGETS") != nullptr;
+    if (!enabled) return 0;
+    const auto& color = state.colors.empty() ? state.color : state.colors.front();
+    const bool hasColor = !state.colors.empty() || state.color.address != 0;
+    const std::uint64_t key = hasColor ? (0x4000000000000000ull | color.address) : state.depth ? (0x2000000000000000ull | state.depth->address) : 0x1000000000000000ull;
+    static std::mutex mutex;
+    static std::set<std::uint64_t> described;
+    std::lock_guard lock(mutex);
+    if (described.size() < 256 && described.insert(key).second) {
+        std::fprintf(stderr, "[local-pass] key 0x%llx: colors %zu first %ux%u vkfmt %d samples %u; depth 0x%llx %ux%u vkfmt %d test %d write %d; path %d tess %d mesh %d rect %d\n", static_cast<unsigned long long>(key), state.colors.size(), color.extent.width, color.extent.height, static_cast<int>(color.format), color.samples, state.depth ? static_cast<unsigned long long>(state.depth->address) : 0ull, state.depth ? state.depth->extent.width : 0u, state.depth ? state.depth->extent.height : 0u, state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.stages.path), state.stages.tessellation.has_value() ? 1 : 0, state.stages.mesh.has_value() ? 1 : 0, state.rectList ? 1 : 0);
+    }
+    return key;
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -1699,7 +1714,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
-    const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    const auto localPassKey = LocalPassTimingKey(state);
+    const auto drawTiming = !continued ? (localPassKey != 0 ? recorder->BeginGpuTiming(localPassKey) : recorder->BeginGpuTiming(CommandClass::Draw)) : Recorder::NoTiming;
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
