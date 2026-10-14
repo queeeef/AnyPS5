@@ -42,6 +42,7 @@ struct Sampler {
     std::string path;
     std::mutex mutex;
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> counts;
+    std::map<std::vector<std::uint64_t>, std::uint64_t> stacks;
     std::uint64_t samples = 0;
     std::uint64_t window = 0;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
@@ -104,6 +105,7 @@ struct Sampler {
             if (i == 0) ++count.first;
             ++count.second;
         }
+        if (queue != 0xffffffffu) ++stacks[frames];
     }
 
     void write() {
@@ -129,8 +131,43 @@ struct Sampler {
             const char* base = std::strrchr(name, '\\');
             std::fprintf(file, "%s 0x%llx %llu %llu\n", base ? base + 1 : name, static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(module)), static_cast<unsigned long long>(count.first), static_cast<unsigned long long>(count.second));
         }
+        std::map<std::uint64_t, std::pair<std::string, std::uint64_t>> modules;
+        const auto describe = [&](std::uint64_t address) {
+            auto found = modules.upper_bound(address);
+            if (found != modules.begin()) {
+                --found;
+                if (address - found->first < found->second.second) {
+                    char text[96];
+                    std::snprintf(text, sizeof(text), "%s+0x%llx", found->second.first.c_str(), static_cast<unsigned long long>(address - found->first));
+                    return std::string(text);
+                }
+            }
+            HMODULE module = nullptr;
+            char name[MAX_PATH] = "?";
+            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module)) {
+                char text[32];
+                std::snprintf(text, sizeof(text), "?+0x%llx", static_cast<unsigned long long>(address));
+                return std::string(text);
+            }
+            GetModuleFileNameA(module, name, sizeof(name));
+            const char* base = std::strrchr(name, '\\');
+            MEMORY_BASIC_INFORMATION info{};
+            std::uint64_t extent = 1;
+            const auto start = reinterpret_cast<std::uint64_t>(module);
+            for (auto cursor = start; VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &info, sizeof(info)) != 0 && info.AllocationBase == reinterpret_cast<PVOID>(module); cursor += info.RegionSize) extent = cursor + info.RegionSize - start;
+            modules[start] = {base ? base + 1 : name, extent};
+            char text[96];
+            std::snprintf(text, sizeof(text), "%s+0x%llx", base ? base + 1 : name, static_cast<unsigned long long>(address - start));
+            return std::string(text);
+        };
+        for (const auto& [frames, count] : stacks) {
+            std::string line = "stack " + std::to_string(count);
+            for (const auto frame : frames) line += " " + describe(frame);
+            std::fprintf(file, "%s\n", line.c_str());
+        }
         std::fclose(file);
         counts.clear();
+        stacks.clear();
         samples = 0;
     }
 };

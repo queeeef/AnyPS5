@@ -2105,6 +2105,22 @@ void SetHostImportWindow(std::uint64_t bytes) {
     importWindow.store(bytes, std::memory_order_relaxed);
 }
 
+struct LocalImportLookups {
+    std::uint64_t calls = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t staleDevice = 0;
+    std::uint64_t staleGeneration = 0;
+    std::uint64_t misses = 0;
+    double slowMs = 0;
+    std::uint64_t generationAtWindow = 0;
+    std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+
+LocalImportLookups& localImportLookups() {
+    static LocalImportLookups lookups;
+    return lookups;
+}
+
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
@@ -2113,13 +2129,22 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     bool notes = false;
     {
         std::lock_guard lock(state.mutex);
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        auto& lookups = localImportLookups();
+        ++lookups.calls;
         const auto frame = GuestMemory::FrameSerial();
         const HostImport* hit = nullptr;
-        if (!importsStale(context, state)) hit = findImport(state, address, address + bytes);
+        const bool stale = importsStale(context, state);
+        if (!stale) hit = findImport(state, address, address + bytes);
         if (hit != nullptr) {
+            ++lookups.hits;
             hit->lastUseFrame = frame;
             result = hit;
         } else {
+            const auto slowStarted = std::chrono::steady_clock::now();
+            if (!stale) ++lookups.misses;
+            else if (state.device != context.device) ++lookups.staleDevice;
+            else ++lookups.staleGeneration;
             const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
             refreshImports(context, state, lease);
             if (runCovers(lease, address, address + bytes)) {
@@ -2129,6 +2154,16 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
             } else if (const auto* joined = findImport(state, address, address + bytes)) {
                 joined->lastUseFrame = frame;
                 result = joined;
+            }
+            lookups.slowMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slowStarted).count();
+        }
+        if (profile) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lookups.window >= std::chrono::seconds(10)) {
+                const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+                std::fprintf(stderr, "[local-import-lookups] 10 s: %llu HostImportFor calls, %llu fast hits, slow: %llu registry changed, %llu device changed, %llu not imported yet; %.1f ms in slow paths; registry generation advanced %llu; %zu imports\n", static_cast<unsigned long long>(lookups.calls), static_cast<unsigned long long>(lookups.hits), static_cast<unsigned long long>(lookups.staleGeneration), static_cast<unsigned long long>(lookups.staleDevice), static_cast<unsigned long long>(lookups.misses), lookups.slowMs, static_cast<unsigned long long>(generation - lookups.generationAtWindow), state.imports.size());
+                lookups = LocalImportLookups{};
+                lookups.generationAtWindow = generation;
             }
         }
         notes = !state.unwatchedNotes.empty();
@@ -2224,15 +2259,14 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    return containingRange(lease, address, address + bytes) != nullptr;
+    const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(address), false);
+    return range != nullptr && range->readable && address >= range->address && address + bytes <= range->address + range->bytes;
 }
 
 std::uint64_t RegisteredReadableEnd(std::uint64_t address) {
     if (address == std::numeric_limits<std::uint64_t>::max()) return 0;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    const auto* range = containingRange(lease, address, address + 1);
-    return range != nullptr ? range->address + range->bytes : 0;
+    const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(address), false);
+    return range != nullptr && range->readable && address >= range->address && address < range->address + range->bytes ? range->address + range->bytes : 0;
 }
 
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
