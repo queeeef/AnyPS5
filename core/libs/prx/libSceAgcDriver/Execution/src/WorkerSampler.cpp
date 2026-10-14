@@ -24,7 +24,16 @@ namespace AgcDriver {
 namespace {
 
 std::jthread processSamplerThread;
-std::jthread workerSamplerThread;
+std::once_flag processSamplerStarted;
+std::mutex workerSamplersMutex;
+std::vector<std::jthread> workerSamplerThreads;
+
+std::uint64_t ThreadCpu100ns(HANDLE thread, std::uint64_t& kernel) {
+    FILETIME created{}, exited{}, kernelTime{}, userTime{};
+    if (!GetThreadTimes(thread, &created, &exited, &kernelTime, &userTime)) return kernel = 0;
+    kernel = (static_cast<std::uint64_t>(kernelTime.dwHighDateTime) << 32u) | kernelTime.dwLowDateTime;
+    return (static_cast<std::uint64_t>(userTime.dwHighDateTime) << 32u) | userTime.dwLowDateTime;
+}
 
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
 // writes "module+offset self inclusive" lines to <file> for offline symbolization with nm.
@@ -36,6 +45,11 @@ struct Sampler {
     std::uint64_t samples = 0;
     std::uint64_t window = 0;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    std::uint32_t queue = 0xffffffffu;
+    DWORD threadId = 0;
+    std::uint64_t lastUser = 0;
+    std::uint64_t lastKernel = 0;
+    std::chrono::steady_clock::time_point lastWrite = std::chrono::steady_clock::now();
 
     ~Sampler() noexcept(false) {
         if (target != nullptr && !CloseHandle(target)) throw std::system_error(GetLastError(), std::system_category(), "Closing sampler thread handle");
@@ -96,7 +110,18 @@ struct Sampler {
         std::lock_guard lock(mutex);
         std::FILE* file = std::fopen(path.c_str(), window == 0 ? "w" : "a");
         if (file == nullptr) return;
-        std::fprintf(file, "# window %llu at %.0f s: %llu samples\n", static_cast<unsigned long long>(window++), std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(), static_cast<unsigned long long>(samples));
+        const auto now = std::chrono::steady_clock::now();
+        const double wall = std::chrono::duration<double>(now - lastWrite).count();
+        lastWrite = now;
+        std::uint64_t kernel = 0;
+        const auto user = ThreadCpu100ns(target, kernel);
+        const double userSeconds = static_cast<double>(user - lastUser) / 1e7;
+        const double kernelSeconds = static_cast<double>(kernel - lastKernel) / 1e7;
+        lastUser = user;
+        lastKernel = kernel;
+        std::fprintf(file, "# window %llu at %.0f s: %llu samples; cpu %.2f s user + %.2f s kernel over %.1f s wall\n", static_cast<unsigned long long>(window), std::chrono::duration<double>(now - started).count(), static_cast<unsigned long long>(samples), userSeconds, kernelSeconds, wall);
+        if (queue != 0xffffffffu) std::fprintf(stderr, "[local-worker-cpu] queue 0x%x thread %lu window %llu: cpu %.2f s user + %.2f s kernel over %.1f s wall (%.0f%%), %llu samples\n", queue, static_cast<unsigned long>(threadId), static_cast<unsigned long long>(window), userSeconds, kernelSeconds, wall, wall > 0 ? 100.0 * (userSeconds + kernelSeconds) / wall : 0.0, static_cast<unsigned long long>(samples));
+        ++window;
         for (const auto& [address, count] : counts) {
             HMODULE module = nullptr;
             char name[MAX_PATH] = "?";
@@ -192,14 +217,20 @@ void StartProcessSampler() {
 
 }
 
-void StartWorkerSampler() {
-    StartProcessSampler();
+void StartWorkerSampler(std::uint32_t queue) {
+    std::call_once(processSamplerStarted, StartProcessSampler);
     const char* path = std::getenv("APS5_SAMPLE_WORKER");
     if (path == nullptr) return;
     auto sampler = std::make_unique<Sampler>();
-    sampler->path = path;
+    sampler->queue = queue;
+    sampler->threadId = GetCurrentThreadId();
+    char suffix[64];
+    std::snprintf(suffix, sizeof(suffix), "-q%x-t%lu.txt", queue, static_cast<unsigned long>(sampler->threadId));
+    sampler->path = std::string(path) + suffix;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
-    workerSamplerThread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
+    sampler->lastUser = ThreadCpu100ns(sampler->target, sampler->lastKernel);
+    std::lock_guard lock(workerSamplersMutex);
+    workerSamplerThreads.emplace_back([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
         const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         while (!token.stop_requested()) {
@@ -208,7 +239,7 @@ void StartWorkerSampler() {
             if (timer != nullptr && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
             else std::this_thread::sleep_for(std::chrono::milliseconds(1));
             sampler->sample();
-            if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
+            if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(10)) {
                 sampler->write();
                 flushed = std::chrono::steady_clock::now();
             }
@@ -220,12 +251,19 @@ void StartWorkerSampler() {
 
 void StopWorkerSampler() {
     processSamplerThread.request_stop();
-    workerSamplerThread.request_stop();
+    std::vector<std::jthread> threads;
+    {
+        std::lock_guard lock(workerSamplersMutex);
+        threads.swap(workerSamplerThreads);
+    }
+    for (auto& thread : threads) thread.request_stop();
     if (processSamplerThread.joinable()) processSamplerThread.join();
-    if (workerSamplerThread.joinable()) workerSamplerThread.join();
+    for (auto& thread : threads) {
+        if (thread.joinable()) thread.join();
+    }
 }
 #else
-void StartWorkerSampler() {}
+void StartWorkerSampler(std::uint32_t) {}
 void StopWorkerSampler() {}
 #endif
 
