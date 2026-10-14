@@ -1662,6 +1662,83 @@ std::uint64_t LocalPassTimingKey(const State& state) {
     return key;
 }
 
+struct LocalDrawGpuStats {
+    std::uint64_t draws = 0;
+    std::uint64_t elements = 0;
+    std::uint64_t instances = 0;
+    std::uint64_t indirect = 0;
+    std::uint64_t splitFaces = 0;
+    std::uint64_t splitChannel = 0;
+    std::uint64_t vertexBindings = 0;
+    std::uint64_t addressBased = 0;
+    std::uint64_t passKey = 0;
+    std::size_t vertexWords = 0;
+    std::size_t fragmentWords = 0;
+    std::size_t stages = 0;
+};
+
+std::uint64_t LocalDrawGpuKey(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawInputs& inputs, bool indirect, bool splitFaces, bool splitChannel, bool addressBased) {
+    static const char* directory = std::getenv("APS5_PROFILE_DRAW_GPU");
+    if (directory == nullptr) return 0;
+    std::uint64_t hash = 1469598103934665603ull;
+    const ShaderRecompiler::RecompileResult* vertex = nullptr;
+    const ShaderRecompiler::RecompileResult* fragment = nullptr;
+    for (const auto& shader : shaders) {
+        hash = (hash ^ reinterpret_cast<std::uintptr_t>(shader.program)) * 1099511628211ull;
+        if (shader.stage == ShaderRecompiler::ShaderStage::Fragment) fragment = shader.program;
+        else if (vertex == nullptr) vertex = shader.program;
+    }
+    const std::uint64_t key = 0x0800000000000000ull | (hash & 0x0000ffffffffffffull);
+    static std::mutex mutex;
+    static std::map<std::uint64_t, LocalDrawGpuStats> stats;
+    static auto window = std::chrono::steady_clock::now();
+    static std::set<std::uint64_t> dumped;
+    std::lock_guard lock(mutex);
+    auto& entry = stats[key];
+    ++entry.draws;
+    entry.elements += static_cast<std::uint64_t>(draw.indexCount) * std::max<std::uint32_t>(draw.instanceCount, 1u);
+    entry.instances += draw.instanceCount;
+    entry.indirect += indirect ? 1 : 0;
+    entry.splitFaces += splitFaces ? 1 : 0;
+    entry.splitChannel += splitChannel ? 1 : 0;
+    entry.vertexBindings += inputs.vertexHandles.size();
+    entry.addressBased += addressBased ? 1 : 0;
+    entry.passKey = LocalPassTimingKey(state);
+    entry.vertexWords = vertex != nullptr ? vertex->spirv.size() : 0;
+    entry.fragmentWords = fragment != nullptr ? fragment->spirv.size() : 0;
+    entry.stages = shaders.size();
+    if (*directory != '\0' && dumped.size() < 512 && dumped.insert(key).second) {
+        const auto dump = [&](const ShaderRecompiler::RecompileResult* program, const char* stage) {
+            if (program == nullptr) return;
+            char name[512];
+            std::snprintf(name, sizeof(name), "%s/%llx_%s.spv", directory, static_cast<unsigned long long>(key), stage);
+            if (std::FILE* file = std::fopen(name, "wb")) {
+                const auto& words = program->spirv.Words();
+                std::fwrite(words.data(), sizeof(std::uint32_t), words.size(), file);
+                std::fclose(file);
+            }
+        };
+        dump(vertex, "vs");
+        dump(fragment, "fs");
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window >= std::chrono::seconds(10)) {
+        window = now;
+        std::vector<std::pair<std::uint64_t, LocalDrawGpuStats>> hot(stats.begin(), stats.end());
+        std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+        std::string line = "[local-draw-gpu] 10 s:";
+        for (std::size_t i = 0; i < hot.size() && i < 400; ++i) {
+            const auto& [name, values] = hot[i];
+            char text[400];
+            std::snprintf(text, sizeof(text), " {0x%llx pass 0x%llx draws %llu elements %llu instances %llu indirect %llu split-faces %llu split-channel %llu vertex-bindings %llu address-based %llu stages %zu vs %zu fs %zu}", static_cast<unsigned long long>(name), static_cast<unsigned long long>(values.passKey), static_cast<unsigned long long>(values.draws), static_cast<unsigned long long>(values.elements), static_cast<unsigned long long>(values.instances), static_cast<unsigned long long>(values.indirect), static_cast<unsigned long long>(values.splitFaces), static_cast<unsigned long long>(values.splitChannel), static_cast<unsigned long long>(values.vertexBindings), static_cast<unsigned long long>(values.addressBased), values.stages, values.vertexWords, values.fragmentWords);
+            line += text;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        stats.clear();
+    }
+    return key;
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -1775,6 +1852,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    const auto localDrawKey = LocalDrawGpuKey(state, draw, shaders, inputs, args != nullptr, record.pipeline->SplitsFaces(), record.pipeline->SplitsSecondChannel(), addressBased || resources.UsesAddressTable());
+    const auto localDrawTiming = localDrawKey != 0 ? recorder->BeginGpuTiming(localDrawKey) : Recorder::NoTiming;
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state);
@@ -1784,6 +1863,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
+    recorder->EndGpuTiming(localDrawTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
