@@ -48,16 +48,38 @@ struct Sampler {
         const bool captured = GetThreadContext(target, &context) != 0;
         std::vector<std::uint64_t> frames;
         if (captured) {
-            // Unwinding reads the target's stack while it is suspended; frames without unwind data
-            // (JIT/guest code) end the walk.
+            // Unwinding reads the target's stack while it is suspended. A frame without unwind data is a
+            // leaf (return address at RSP) when that address has unwind data, else walked by its RBP chain.
+            const auto read = [](std::uint64_t address, std::uint64_t& value) {
+                SIZE_T got = 0;
+                return address % 8 == 0 && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address), &value, sizeof(value), &got) && got == sizeof(value);
+            };
+            const auto unwound = [](std::uint64_t address) {
+                DWORD64 base = 0;
+                return address != 0 && RtlLookupFunctionEntry(address, &base, nullptr) != nullptr;
+            };
             for (int depth = 0; depth < 64 && context.Rip != 0; ++depth) {
                 frames.push_back(context.Rip);
                 DWORD64 imageBase = 0;
                 auto* entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
-                if (entry == nullptr) break;
-                PVOID handler = nullptr;
-                DWORD64 establisher = 0;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handler, &establisher, nullptr);
+                if (entry != nullptr) {
+                    PVOID handler = nullptr;
+                    DWORD64 establisher = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handler, &establisher, nullptr);
+                    continue;
+                }
+                std::uint64_t leafReturn = 0;
+                if (read(context.Rsp, leafReturn) && unwound(leafReturn)) {
+                    context.Rip = leafReturn;
+                    context.Rsp += 8;
+                    continue;
+                }
+                std::uint64_t savedFrame = 0;
+                std::uint64_t frameReturn = 0;
+                if (context.Rbp < context.Rsp || context.Rbp - context.Rsp > (8u << 20u) || !read(context.Rbp, savedFrame) || !read(context.Rbp + 8, frameReturn) || frameReturn == 0) break;
+                context.Rip = frameReturn;
+                context.Rsp = context.Rbp + 16;
+                context.Rbp = savedFrame;
             }
         }
         ResumeThread(target);
@@ -179,8 +201,12 @@ void StartWorkerSampler() {
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
     workerSamplerThread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
+        const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         while (!token.stop_requested()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            LARGE_INTEGER due{};
+            due.QuadPart = -10000;
+            if (timer != nullptr && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
+            else std::this_thread::sleep_for(std::chrono::milliseconds(1));
             sampler->sample();
             if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
                 sampler->write();
@@ -188,6 +214,7 @@ void StartWorkerSampler() {
             }
         }
         sampler->write();
+        if (timer != nullptr) CloseHandle(timer);
     });
 }
 
