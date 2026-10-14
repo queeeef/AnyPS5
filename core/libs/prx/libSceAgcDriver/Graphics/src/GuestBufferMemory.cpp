@@ -12,6 +12,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <fcntl.h>
 #include <linux/udmabuf.h>
@@ -2191,6 +2192,13 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
                 const auto share = [&](int i) { return windowTicks > 0 ? 100.0 * static_cast<double>(arena[i] - previous[i]) / windowTicks : 0.0; };
                 std::fprintf(stderr, "[local-arena-thread] thread %lu 10 s: %llu write-watch collects (%.1f%% of the window inside them), %llu VirtualQuery, %llu VirtualProtect re-arms (%.1f%% inside them), %llu write faults handled here, %llu debugger-resolved faults drained, %llu host-write opens\n", static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(arena[0] - previous[0]), share(6), static_cast<unsigned long long>(arena[1] - previous[1]), static_cast<unsigned long long>(arena[2] - previous[2]), share(7), static_cast<unsigned long long>(arena[3] - previous[3]), static_cast<unsigned long long>(arena[4] - previous[4]), static_cast<unsigned long long>(arena[5] - previous[5]));
                 for (int i = 0; i < 9; ++i) previous[i] = arena[i];
+                PROCESS_MEMORY_COUNTERS memory{};
+                memory.cb = sizeof(memory);
+                static std::uint64_t previousFaults = 0;
+                if (K32GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory))) {
+                    std::fprintf(stderr, "[local-process-memory] 10 s: %llu page faults (all threads), working set %.0f MiB (peak %.0f), commit %.0f MiB\n", static_cast<unsigned long long>(memory.PageFaultCount - previousFaults), memory.WorkingSetSize / 1048576.0, memory.PeakWorkingSetSize / 1048576.0, memory.PagefileUsage / 1048576.0);
+                    previousFaults = memory.PageFaultCount;
+                }
 #endif
             }
         }
