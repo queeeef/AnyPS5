@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <mutex>
 #include <array>
 #include <chrono>
@@ -1150,7 +1151,12 @@ struct ThreadCollectMemo {
     }
 #endif
 };
-thread_local ThreadCollectMemo threadCollectMemo;
+// Per thread through HostThreadLocal: on Windows a module's thread_local destructor runs after the
+// emulated TLS freed the object (the memo owns maps and vectors).
+struct ThreadCollectMemoTag {};
+ThreadCollectMemo& threadMemo() {
+    return HostThreadLocal<ThreadCollectMemo, ThreadCollectMemoTag>();
+}
 
 bool cleanSetEnabled() {
 #ifdef _WIN32
@@ -1273,11 +1279,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
-        if (threadCollectMemo.Covers(epoch, unwatched, first, stop)) {
+        if (threadMemo().Covers(epoch, unwatched, first, stop)) {
             collectMemoHits.fetch_add(1, std::memory_order_relaxed);
             return tracker.generation.load(std::memory_order_relaxed);
         }
-        for (const auto& entry : threadCollectMemo.entries) {
+        for (const auto& entry : threadMemo().entries) {
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
@@ -1288,7 +1294,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
 #ifdef _WIN32
         // Like a memo entry, a clean entry exists only for a completed walk of an in-arena range.
-        if (cleanSetEnabled() && threadCollectMemo.CleanCovers(epoch, unwatched, first, stop)) {
+        if (cleanSetEnabled() && threadMemo().CleanCovers(epoch, unwatched, first, stop)) {
             cleanSetHits.fetch_add(1, std::memory_order_relaxed);
             return tracker.generation.load(std::memory_order_relaxed);
         }
@@ -1324,12 +1330,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
         else {
-            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
-            threadCollectMemo.Remember(epoch, serial, first, stop);
+            threadMemo().entries[threadMemo().next++ % threadMemo().entries.size()] = {first, stop, epoch, serial};
+            threadMemo().Remember(epoch, serial, first, stop);
 #ifdef _WIN32
             // The drain of CleanCovers ran before the walk under the same unwatch serial, so the log
             // since then names any page forgotten after this proof.
-            if (useMemo && cleanSetEnabled() && serial == threadCollectMemo.cleanUnwatched && epoch == threadCollectMemo.cleanEpoch) threadCollectMemo.RememberClean(first, stop);
+            if (useMemo && cleanSetEnabled() && serial == threadMemo().cleanUnwatched && epoch == threadMemo().cleanEpoch) threadMemo().RememberClean(first, stop);
 #endif
         }
     }
@@ -1421,6 +1427,10 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     if (!import()) return false;
     if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
     return true;
+}
+
+std::uint64_t UnwatchSerial() {
+    return unwatchSerial.load(std::memory_order_acquire);
 }
 
 bool WriteWatched() {
