@@ -2073,6 +2073,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         Require(rangeBytes <= std::numeric_limits<std::size_t>::max(), "indirect draw record range overflow");
         if (!gpuIndirectDraws) indirect.path = IndirectDrawPath::Disabled;
         else indirect.path = decide(args->arguments, static_cast<std::size_t>(rangeBytes), indirect.argumentImport);
+        if (indirect.path == IndirectDrawPath::Gpu && state.rectList && recorder != nullptr && recorder->PendingWriteOverlaps(args->arguments, static_cast<std::size_t>(rangeBytes))) {
+            Recorder::CountSync(2);
+            recorder->SyncThrough(args->arguments, static_cast<std::size_t>(rangeBytes));
+        }
         if (indirect.path == IndirectDrawPath::Gpu && args->countIndirect) {
             Require(context.drawIndirectCount, "indirect draw count without VK_KHR_draw_indirect_count must be resolved by the driver");
             indirect.path = decide(args->countAddress, 4, indirect.countImport);
