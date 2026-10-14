@@ -1373,6 +1373,59 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
 // the record's dword as the first vertex / instance, and the constant is what the fixed-function
 // fetch must start at). The scratch is kept until the batch completed. Returns whether a copy was
 // rewritten; `argumentBuffer`/`argumentOffset` receive where the draw reads the records.
+void NoteRectIndirect(Recorder* recorder, const State& state, const Pm4::DrawParameters::IndirectDraw& args, bool rewritten) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile || recorder == nullptr) return;
+    struct Stats {
+        std::mutex mutex;
+        std::map<std::string, std::array<std::uint64_t, 4>> byTarget;
+        std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+        int described = 0;
+    };
+    static Stats stats;
+    char text[320];
+    const auto& color = state.colors.empty() ? state.color : state.colors.front();
+    std::snprintf(text, sizeof(text), "target 0x%llx %ux%u vkfmt %d colors %zu dcc 0x%llx cmask 0x%llx fastclear %d clear %08x%08x depth %d", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), state.colors.size(), static_cast<unsigned long long>(color.dccAddress), static_cast<unsigned long long>(color.cmaskAddress), color.cmaskFastClear ? 1 : 0, color.clearWords[1], color.clearWords[0], state.depthTest ? 1 : 0);
+    std::string target = text;
+    {
+        std::lock_guard lock(stats.mutex);
+        if (stats.described < 24) {
+            ++stats.described;
+            std::fprintf(stderr, "[local-rect-indirect] draw: %s; args 0x%llx stride %u count %u%s, record %u bytes, vertex %s %u instance %s %u, args pending GPU write %d, rewritten %d\n", target.c_str(), static_cast<unsigned long long>(args.arguments), args.stride, args.count, args.countIndirect ? " (count from memory)" : "", args.recordBytes, args.vertexRule == Pm4::DrawParameters::IndirectDraw::Rule::InPlace ? "in-place" : "const", args.vertexConstant, args.instanceRule == Pm4::DrawParameters::IndirectDraw::Rule::InPlace ? "in-place" : "const", args.instanceConstant, recorder->PendingWriteOverlaps(args.arguments, static_cast<std::size_t>(args.RangeBytes())) ? 1 : 0, rewritten ? 1 : 0);
+        }
+    }
+    const auto address = args.arguments;
+    const auto stride = args.stride;
+    const auto count = args.count;
+    recorder->OnComplete([target, address, stride, count] {
+        std::uint64_t rects = 0;
+        bool empty = true;
+        std::uint32_t first[4]{};
+        for (std::uint32_t record = 0; record < count; ++record) {
+            std::uint32_t words[4]{};
+            std::memcpy(words, reinterpret_cast<const void*>(address + static_cast<std::uint64_t>(record) * stride), sizeof(words));
+            if (record == 0) std::memcpy(first, words, sizeof(first));
+            if (words[0] != 0 && words[1] != 0) {
+                empty = false;
+                rects += static_cast<std::uint64_t>(words[0] / 3u) * words[1];
+            }
+        }
+        std::lock_guard lock(stats.mutex);
+        auto& entry = stats.byTarget[target];
+        ++entry[0];
+        if (empty) ++entry[1];
+        entry[2] += rects;
+        entry[3] = (static_cast<std::uint64_t>(first[0]) << 32u) | first[1];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - stats.window < std::chrono::seconds(10)) return;
+        stats.window = now;
+        std::string line = "[local-rect-indirect] 10 s:";
+        for (const auto& [name, values] : stats.byTarget) line += " {" + name + ": draws " + std::to_string(values[0]) + ", empty " + std::to_string(values[1]) + ", rects " + std::to_string(values[2]) + ", last first record " + std::to_string(values[3] >> 32u) + "x" + std::to_string(values[3] & 0xffffffffu) + "}";
+        std::fprintf(stderr, "%s\n", line.c_str());
+        stats.byTarget.clear();
+    });
+}
+
 bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, Recorder* recorder, bool recorded, const IndirectRecord& indirect, std::unique_ptr<DeviceBuffer>& scratch, VkBuffer& argumentBuffer, VkDeviceSize& argumentOffset, const std::function<void(std::uint32_t)>& countBarrier) {
     using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
     const auto* args = indirect.args;
@@ -1741,6 +1794,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             argumentBuffer = meshArguments->Handle();
         } else if (gpuIndirect) {
             rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
+            if (state.rectList) NoteRectIndirect(recorder, state, *record.indirect->args, rewritten);
         }
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
@@ -2237,6 +2291,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     } else if (gpuIndirect) {
         rewritten = recordIndirectArguments(context, commands, recorder, recorded, indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
+        if (state.rectList) NoteRectIndirect(recorder, state, *indirect.args, rewritten);
     }
     for (auto& binding : targets) {
         if (binding.proxied) {
