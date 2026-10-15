@@ -3292,6 +3292,10 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
     Require(!prepared && !uploaded, "guest memory was already uploaded");
+    // Diagnostic (APS5_LOCAL_DISSOLVE_LATE=1): a build that took base regions dissolves the rest of
+    // the space here, so only the decisions made while regions were added differ from a whole dissolve.
+    static const bool lateDissolve = std::getenv("APS5_LOCAL_DISSOLVE_LATE") != nullptr;
+    if (lateDissolve && space != nullptr && !excluded.empty()) dissolveSpace(false);
     prepared = true;
     std::vector<std::uint32_t> order(regions.size());
     std::iota(order.begin(), order.end(), 0u);
@@ -3690,6 +3694,88 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         if (profile) copyUs += microsecondsSince(copyStart);
     }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
+    // Diagnostics of the local dissolve (WIP): APS5_CHECK_LOCAL_DISSOLVE=1 checks a build that kept
+    // the space after its upload; APS5_LOCAL_DISSOLVE_AFTER=1 dissolves the rest of the space here,
+    // after the upload ran with it, so every later lookup sees a whole dissolve.
+    static const bool checkLocal = std::getenv("APS5_CHECK_LOCAL_DISSOLVE") != nullptr;
+    static const bool dissolveAfter = std::getenv("APS5_LOCAL_DISSOLVE_AFTER") != nullptr;
+    if (checkLocal && space != nullptr && !excluded.empty()) {
+        struct Check {
+            std::mutex mutex;
+            std::uint64_t builds = 0, ownOverKept = 0, staleKept = 0, staleAddress = 0, epochMoved = 0, tableBad = 0, writesUncovered = 0;
+            int logged = 0;
+            std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        };
+        static Check check;
+        std::uint64_t ownOverKept = 0, staleKept = 0, staleAddress = 0, tableBad = 0, writesUncovered = 0;
+        bool epochMoved = false;
+        std::string first;
+        const auto note = [&](const char* what, std::uint64_t begin, std::uint64_t end, std::uint64_t other) {
+            if (!first.empty()) return;
+            char text[256];
+            std::snprintf(text, sizeof(text), "%s 0x%llx-0x%llx (0x%llx)", what, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(other));
+            first = text;
+        };
+        const auto& base = space->base;
+        for (const auto& region : regions) {
+            auto it = std::upper_bound(base.begin(), base.end(), region.begin, [](std::uint64_t value, const Region& entry) { return value < entry.begin; });
+            if (it != base.begin()) --it;
+            for (; it != base.end() && it->begin < region.end; ++it) {
+                if (it->end <= region.begin || baseExcluded(static_cast<std::size_t>(it - base.begin()))) continue;
+                ++ownOverKept;
+                note("own region over a kept base region", region.begin, region.end, it->begin);
+            }
+        }
+        {
+            auto& state = Imports();
+            std::lock_guard lock(state.mutex);
+            epochMoved = state.epoch != space->importsEpoch;
+            for (std::size_t index = 0; index < base.size(); ++index) {
+                if (baseExcluded(index)) continue;
+                const auto& region = base[index];
+                if (region.direct == nullptr) continue;
+                const auto* current = findImport(state, region.begin, region.end);
+                if (current != region.direct) {
+                    ++staleKept;
+                    note("kept base region's import is not the current one", region.begin, region.end, current != nullptr ? current->base : 0);
+                } else if (index < space->ranges.size() && space->ranges[index].deviceAddress != current->address + (region.begin - current->base)) {
+                    ++staleAddress;
+                    note("kept base region's BDA address is not its import's", region.begin, region.end, space->ranges[index].deviceAddress);
+                }
+            }
+        }
+        const auto ranges = AddressRanges();
+        for (std::size_t index = 1; index < ranges.size(); ++index) {
+            if (ranges[index - 1].end <= ranges[index].begin) continue;
+            ++tableBad;
+            note("BDA table entries overlap", ranges[index - 1].begin, ranges[index - 1].end, ranges[index].begin);
+        }
+        for (const auto& [begin, end] : writes) {
+            const auto* found = owner(begin);
+            if (found != nullptr && found->begin <= begin && end <= found->end) continue;
+            ++writesUncovered;
+            note("write range without one owner", begin, end, found != nullptr ? found->begin : 0);
+        }
+        std::lock_guard lock(check.mutex);
+        ++check.builds;
+        check.ownOverKept += ownOverKept;
+        check.staleKept += staleKept;
+        check.staleAddress += staleAddress;
+        check.epochMoved += epochMoved ? 1 : 0;
+        check.tableBad += tableBad;
+        check.writesUncovered += writesUncovered;
+        if (!first.empty() && check.logged < 20) {
+            ++check.logged;
+            std::fprintf(stderr, "[local-dissolve-check] %s (excluded %zu, own regions %zu, epoch moved %d)\n", first.c_str(), excluded.size(), regions.size(), epochMoved ? 1 : 0);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - check.last >= std::chrono::seconds(10)) {
+            check.last = now;
+            std::fprintf(stderr, "[local-dissolve-check] %llu builds checked: own over kept %llu, stale kept imports %llu, stale kept addresses %llu, import epoch moved %llu, table overlaps %llu, writes without one owner %llu\n", static_cast<unsigned long long>(check.builds), static_cast<unsigned long long>(check.ownOverKept), static_cast<unsigned long long>(check.staleKept), static_cast<unsigned long long>(check.staleAddress), static_cast<unsigned long long>(check.epochMoved), static_cast<unsigned long long>(check.tableBad), static_cast<unsigned long long>(check.writesUncovered));
+            check.builds = check.ownOverKept = check.staleKept = check.staleAddress = check.epochMoved = check.tableBad = check.writesUncovered = 0;
+        }
+    }
+    if (dissolveAfter && space != nullptr && !excluded.empty()) dissolveSpace(false);
     takeHeapReferences();
     if (!profile) return;
     const auto loopUs = microsecondsSince(loopStart);
