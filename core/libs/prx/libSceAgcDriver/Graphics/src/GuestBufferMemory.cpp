@@ -143,6 +143,8 @@ struct AddressSpaceCache {
     std::atomic<std::uint64_t> unpublished{0};
     std::atomic<std::uint64_t> dissolvedOverlap{0};
     std::atomic<std::uint64_t> dissolvedImports{0};
+    std::atomic<std::uint64_t> dissolvedLocal{0};
+    std::atomic<std::uint64_t> baseRegionsTaken{0};
     std::atomic<std::uint64_t> waiterDrops{0};
     std::atomic<std::uint64_t> tablesOfSpace{0};
     std::atomic<std::uint64_t> tablesByKey{0};
@@ -153,6 +155,11 @@ struct AddressSpaceCache {
 AddressSpaceCache& Spaces() {
     static AddressSpaceCache cache;
     return cache;
+}
+
+bool localDissolveEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_LOCAL_DISSOLVE") != nullptr;
+    return !disabled;
 }
 
 bool addressSpaceCacheEnabled() {
@@ -2056,7 +2063,7 @@ LeaseStats LeaseCounters() {
 AddressSpaceStats AddressSpaceCounters() {
     const auto& cache = Spaces();
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
-    return {addressSpaceCacheEnabled(), load(cache.hits), load(cache.rebuiltFirst), load(cache.rebuiltGeneration), load(cache.rebuiltEpoch), load(cache.rebuiltDevice), load(cache.rebuiltWaiterDrop), load(cache.unpublished), load(cache.dissolvedOverlap), load(cache.dissolvedImports), load(cache.waiterDrops), load(cache.tablesOfSpace), load(cache.tablesByKey), load(cache.tablesKeyed), load(cache.tablesUnkeyed)};
+    return {addressSpaceCacheEnabled(), load(cache.hits), load(cache.rebuiltFirst), load(cache.rebuiltGeneration), load(cache.rebuiltEpoch), load(cache.rebuiltDevice), load(cache.rebuiltWaiterDrop), load(cache.unpublished), load(cache.dissolvedOverlap), load(cache.dissolvedImports), load(cache.dissolvedLocal), load(cache.baseRegionsTaken), load(cache.waiterDrops), load(cache.tablesOfSpace), load(cache.tablesByKey), load(cache.tablesKeyed), load(cache.tablesUnkeyed)};
 }
 
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit) {
@@ -2586,7 +2593,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
     const auto space = AddressSpaceCounters();
     const auto& spaceSeen = totals.spaceSeen;
-    AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu, held by the space %llu), us per build: table %.0f, fault buffer %.0f; tables by key: the space's own %llu, keyed hits %llu, keyed builds %llu, unkeyed %llu; first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.heldTables, seen.heldTables), per(static_cast<double>(table.tableNanoseconds - seen.tableNanoseconds) / 1000.0), per(static_cast<double>(table.faultNanoseconds - seen.faultNanoseconds) / 1000.0), delta(space.tablesOfSpace, spaceSeen.tablesOfSpace), delta(space.tablesByKey, spaceSeen.tablesByKey), delta(space.tablesKeyed, spaceSeen.tablesKeyed), delta(space.tablesUnkeyed, spaceSeen.tablesUnkeyed), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu (%llu kept the space, %llu base regions taken), imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu, held by the space %llu), us per build: table %.0f, fault buffer %.0f; tables by key: the space's own %llu, keyed hits %llu, keyed builds %llu, unkeyed %llu; first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedLocal, spaceSeen.dissolvedLocal), delta(space.baseRegionsTaken, spaceSeen.baseRegionsTaken), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.heldTables, seen.heldTables), per(static_cast<double>(table.tableNanoseconds - seen.tableNanoseconds) / 1000.0), per(static_cast<double>(table.faultNanoseconds - seen.faultNanoseconds) / 1000.0), delta(space.tablesOfSpace, spaceSeen.tablesOfSpace), delta(space.tablesByKey, spaceSeen.tablesByKey), delta(space.tablesKeyed, spaceSeen.tablesKeyed), delta(space.tablesUnkeyed, spaceSeen.tablesUnkeyed), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -2830,27 +2837,71 @@ GuestBufferMemory::BaseOverlap GuestBufferMemory::baseOverlap(std::uint64_t begi
     if (space == nullptr || space->base.empty()) return BaseOverlap::None;
     const auto& base = space->base;
     const auto found = std::upper_bound(base.begin(), base.end(), begin, [](std::uint64_t value, const Region& region) { return value < region.begin; });
-    if (found != base.begin()) {
-        const auto& previous = *std::prev(found);
-        if (begin < previous.end) {
-            if (end > previous.end) return BaseOverlap::Partial;
-            if (owner != nullptr) *owner = &previous;
-            return BaseOverlap::Inside;
+    if (excluded.empty()) {
+        if (found != base.begin()) {
+            const auto& previous = *std::prev(found);
+            if (begin < previous.end) {
+                if (end > previous.end) return BaseOverlap::Partial;
+                if (owner != nullptr) *owner = &previous;
+                return BaseOverlap::Inside;
+            }
         }
+        return found != base.end() && found->begin < end ? BaseOverlap::Partial : BaseOverlap::None;
     }
-    return found != base.end() && found->begin < end ? BaseOverlap::Partial : BaseOverlap::None;
+    // The base regions this build took are its own (see excludeBase): only the others count.
+    const Region* inside = nullptr;
+    bool any = false;
+    for (auto it = found == base.begin() ? found : std::prev(found); it != base.end() && it->begin < end; ++it) {
+        if (it->end <= begin || baseExcluded(static_cast<std::size_t>(it - base.begin()))) continue;
+        if (any || it->begin > begin || end > it->end) return BaseOverlap::Partial;
+        any = true;
+        inside = &*it;
+    }
+    if (inside == nullptr) return BaseOverlap::None;
+    if (owner != nullptr) *owner = inside;
+    return BaseOverlap::Inside;
+}
+
+void GuestBufferMemory::excludeBase(std::uint64_t begin, std::uint64_t end) {
+    Require(space != nullptr && !prepared, "base regions are taken before the upload");
+    const auto& base = space->base;
+    auto first = std::upper_bound(base.begin(), base.end(), begin, [](std::uint64_t value, const Region& region) { return value < region.begin; });
+    if (first != base.begin()) --first;
+    std::uint64_t taken = 0;
+    for (auto it = first; it != base.end() && it->begin < end; ++it) {
+        const auto index = static_cast<std::size_t>(it - base.begin());
+        if (it->end <= begin || baseExcluded(index)) continue;
+        excluded.insert(std::upper_bound(excluded.begin(), excluded.end(), index), index);
+        // As dissolveSpace copies it: its `direct` pointer is the space's, trusted while the import
+        // registry's epoch is the space's (UploadPrepare re-checks it).
+        if (regionsSorted) regions.insert(std::upper_bound(regions.begin(), regions.end(), it->begin, [](std::uint64_t value, const Region& region) { return value < region.begin; }), *it);
+        else regions.push_back(*it);
+        ++taken;
+    }
+    importsEpoch = space->importsEpoch;
+    Spaces().dissolvedLocal.fetch_add(1, std::memory_order_relaxed);
+    Spaces().baseRegionsTaken.fetch_add(taken, std::memory_order_relaxed);
 }
 
 void GuestBufferMemory::dissolveSpace(bool resolve) {
     Require(space != nullptr, "no address space to dissolve");
     std::vector<Region> merged;
     merged.reserve(space->base.size() + regions.size());
+    // The base regions this build took are in `regions` already (see excludeBase).
+    std::vector<Region> kept;
+    if (!excluded.empty()) {
+        kept.reserve(space->base.size() - excluded.size());
+        for (std::size_t index = 0; index < space->base.size(); ++index) {
+            if (!baseExcluded(index)) kept.push_back(space->base[index]);
+        }
+    }
+    const auto& base = excluded.empty() ? space->base : kept;
     if (prepared) {
         // Both sorted and disjoint (UploadPrepare merged this build's regions; the space's are
         // registered ranges), so the merge keeps the order Descriptor searches.
-        std::merge(space->base.begin(), space->base.end(), std::make_move_iterator(regions.begin()), std::make_move_iterator(regions.end()), std::back_inserter(merged), [](const Region& left, const Region& right) { return left.begin < right.begin; });
+        std::merge(base.begin(), base.end(), std::make_move_iterator(regions.begin()), std::make_move_iterator(regions.end()), std::back_inserter(merged), [](const Region& left, const Region& right) { return left.begin < right.begin; });
     } else {
-        merged.assign(space->base.begin(), space->base.end());
+        merged.assign(base.begin(), base.end());
         merged.insert(merged.end(), std::make_move_iterator(regions.begin()), std::make_move_iterator(regions.end()));
         regionsSorted = false;
     }
@@ -2863,6 +2914,7 @@ void GuestBufferMemory::dissolveSpace(bool resolve) {
     importsEpoch = space->importsEpoch;
     regions = std::move(merged);
     space.reset();
+    excluded.clear();
 }
 
 const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address) const {
@@ -2874,6 +2926,9 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address)
     };
     const auto* own = candidate(regions);
     const auto* shared = space != nullptr ? candidate(space->base) : nullptr;
+    // A base region this build took is served by its copy in `regions` (merged by UploadPrepare
+    // over it), and nothing of the space lies inside it.
+    if (shared != nullptr && baseExcluded(static_cast<std::size_t>(shared - space->base.data()))) shared = nullptr;
     if (own == nullptr || (shared != nullptr && shared->begin > own->begin)) return shared;
     return own;
 }
@@ -2886,13 +2941,15 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     switch (baseOverlap(begin, end, &inside)) {
         case BaseOverlap::Inside:
             if (!servesView(*inside, begin)) {
-                dissolveSpace(false);
+                if (localDissolveEnabled()) excludeBase(begin, end);
+                else dissolveSpace(false);
                 break;
             }
             return;
         case BaseOverlap::Partial:
             Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
-            dissolveSpace(false);
+            if (localDissolveEnabled()) excludeBase(begin, end);
+            else dissolveSpace(false);
             break;
         case BaseOverlap::None:
             break;
@@ -2977,7 +3034,8 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
     const Region* owner = nullptr;
     if (baseOverlap(snapshot.address, end, &owner) == BaseOverlap::Partial) {
         Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
-        dissolveSpace(false);
+        if (localDissolveEnabled()) excludeBase(snapshot.address, end);
+        else dissolveSpace(false);
     }
     if (owner == nullptr && regionsSorted) {
         const auto found = std::upper_bound(regions.begin(), regions.end(), snapshot.address, [](std::uint64_t value, const Region& region) { return value < region.begin; });
@@ -3981,7 +4039,19 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     if (space != nullptr) {
         std::vector<ShaderRecompiler::BdaAbi::Range> combined;
         combined.reserve(result.size() + space->ranges.size());
-        std::merge(space->ranges.begin(), space->ranges.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+        if (excluded.empty()) {
+            std::merge(space->ranges.begin(), space->ranges.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+        } else {
+            // One entry per base region, in its order (see AcquireRegistered): the taken ones are
+            // served by this build's own regions.
+            Require(space->ranges.size() == space->base.size(), "the address space's table does not follow its base regions");
+            std::vector<ShaderRecompiler::BdaAbi::Range> kept;
+            kept.reserve(space->ranges.size() - excluded.size());
+            for (std::size_t index = 0; index < space->ranges.size(); ++index) {
+                if (!baseExcluded(index)) kept.push_back(space->ranges[index]);
+            }
+            std::merge(kept.begin(), kept.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+        }
         result = std::move(combined);
     }
     if (writes.empty()) return result;
@@ -4031,7 +4101,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::coalesce
 }
 
 std::optional<std::vector<std::uint64_t>> GuestBufferMemory::tableKey() const {
-    if (!space->rangesOrdered) return std::nullopt;
+    if (!space->rangesOrdered || !excluded.empty()) return std::nullopt;
     std::vector<ShaderRecompiler::BdaAbi::Range> own;
     own.reserve(regions.size());
     for (const auto& region : regions) {
@@ -4340,6 +4410,7 @@ void GuestBufferMemory::WriteBack() {
     committed = true;
     lease.clear();
     space.reset();
+    excluded.clear();
     heapReferences.clear();
 }
 
@@ -4347,7 +4418,9 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
     if (!uploaded || committed) return std::nullopt;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (space != nullptr) {
-        for (const auto& region : space->base) {
+        for (std::size_t index = 0; index < space->base.size(); ++index) {
+            const auto& region = space->base[index];
+            if (baseExcluded(index)) continue;
             if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return std::nullopt;
             result.emplace_back(region.begin, region.end);
         }
@@ -4377,8 +4450,9 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (!uploaded || committed) return result;
     if (space != nullptr) {
-        for (const auto& region : space->base) {
-            if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+        for (std::size_t index = 0; index < space->base.size(); ++index) {
+            const auto& region = space->base[index];
+            if (region.direct != nullptr && !baseExcluded(index)) result.emplace_back(region.begin, region.end);
         }
     }
     for (const auto& region : regions) {
@@ -4405,8 +4479,9 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (!uploaded || committed) return result;
     if (space != nullptr) {
-        for (const auto& region : space->base) {
-            if (region.direct != nullptr || region.mirror != nullptr) result.emplace_back(region.begin, region.end);
+        for (std::size_t index = 0; index < space->base.size(); ++index) {
+            const auto& region = space->base[index];
+            if ((region.direct != nullptr || region.mirror != nullptr) && !baseExcluded(index)) result.emplace_back(region.begin, region.end);
         }
     }
     for (const auto& region : regions) {

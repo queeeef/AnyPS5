@@ -169,6 +169,10 @@ struct AddressSpaceStats {
     // its regions, or an import retired under it before the upload.
     std::uint64_t dissolvedOverlap = 0;
     std::uint64_t dissolvedImports = 0;
+    // Of the overlaps, those that kept the space and took only the base regions they overlap
+    // (excludeBase), and how many base regions those took.
+    std::uint64_t dissolvedLocal = 0;
+    std::uint64_t baseRegionsTaken = 0;
     std::uint64_t waiterDrops = 0;
     std::uint64_t tablesOfSpace = 0;
     std::uint64_t tablesByKey = 0;
@@ -368,6 +372,12 @@ private:
     // drops the space: for a region that partially overlaps a base region, and for a build whose
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
+    // For a range crossing a base region's end (or not served by the base region holding it): takes
+    // the base regions overlapping [begin, end) into this build's own regions, where UploadPrepare
+    // merges them with the range exactly as after dissolveSpace, and keeps the space for the rest
+    // (`excluded`). APS5_NO_LOCAL_DISSOLVE=1 dissolves the whole space instead.
+    void excludeBase(std::uint64_t begin, std::uint64_t end);
+    bool baseExcluded(std::size_t index) const { return !excluded.empty() && std::binary_search(excluded.begin(), excluded.end(), index); }
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address) const;
@@ -416,6 +426,9 @@ private:
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
     std::shared_ptr<const AddressSpace> space;
+    // Indices of the space's base regions this build took into `regions` (sorted; see excludeBase):
+    // absent from it for every lookup, list and BDA table of this build.
+    std::vector<std::size_t> excluded;
     mutable std::uint64_t writeTableSerial = 0;
     mutable std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> writeTableRanges;
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while

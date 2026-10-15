@@ -2937,6 +2937,170 @@ bool piecewiseGpuCopyTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+// An address-based build whose descriptor (or snapshot) crosses from one registered range into the
+// next, which does not continue its run: the build takes only the two base regions it crosses from
+// the cached address space (APS5_NO_LOCAL_DISSOLVE=1: all of them) and merges them with the range
+// as before. The crossing view reads and writes both ranges' bytes, a range elsewhere stays bound in
+// place in its import, and the BDA table holds every byte once.
+bool localDissolveTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: local dissolve not tested\n";
+        return false;
+    }
+    const auto piece = static_cast<std::size_t>(std::max<VkDeviceSize>(1u << 16u, context.hostImportAlignment));
+    // A (writable), B (read-only: another run), a gap, C (writable).
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, 4 * piece, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(piece, 4 * piece);
+#endif
+    Require(block != nullptr, "cannot allocate the local dissolve block");
+    auto* first = static_cast<std::byte*>(block);
+    auto* second = first + piece;
+    auto* distant = first + 3 * piece;
+    std::memset(first, 0x11, piece);
+    std::memset(second, 0x22, piece);
+    std::memset(distant, 0x44, piece);
+    std::vector<void*> registered;
+    struct Cleanup {
+        std::vector<void*>& registered;
+        void* block;
+        ~Cleanup() {
+            for (auto* pointer : registered) {
+                try {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(pointer);
+                } catch (...) {
+                }
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } cleanup{registered, block};
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(first, piece, true, true, true);
+        registered.push_back(first);
+        mutation.Add(second, piece, true, false, true);
+        registered.push_back(second);
+        mutation.Add(distant, piece, true, true, true);
+        registered.push_back(distant);
+    }
+    const auto a = reinterpret_cast<std::uint64_t>(first);
+    const auto b = reinterpret_cast<std::uint64_t>(second);
+    const auto c = reinterpret_cast<std::uint64_t>(distant);
+    const bool local = std::getenv("APS5_NO_LOCAL_DISSOLVE") == nullptr && AddressSpaceCounters().enabled;
+    constexpr std::size_t half = 16u << 10u;
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    const auto readBack = [&](const VkDescriptorBufferInfo& view, std::uint32_t adjustment, std::size_t bytes) {
+        auto readback = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        {
+            const auto commands = recorder.Commands();
+            recorder.Keep(readback);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            CopyBuffer(context, commands, view.buffer, view.offset + adjustment, readback->Handle(), 0, bytes);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        settle();
+        const auto bytesRead = readback->Bytes();
+        return std::vector<std::byte>(bytesRead.begin(), bytesRead.begin() + static_cast<std::ptrdiff_t>(bytes));
+    };
+    // The BDA table: sorted, every byte once, the leased ranges covered, and the crossing range
+    // [begin, end) served by one entry (one buffer for the descriptor's bytes and the pointers').
+    const auto checkTable = [&](const GuestBufferMemory& memory, std::uint64_t begin, std::uint64_t end) {
+        const auto ranges = memory.AddressRanges();
+        for (std::size_t index = 1; index < ranges.size(); ++index) Require(ranges[index - 1].end <= ranges[index].begin, "the BDA table of a build that crossed a base region overlaps itself");
+        const auto covered = [&](std::uint64_t from, std::uint64_t to) {
+            auto cursor = from;
+            for (const auto& range : ranges) {
+                if (range.begin <= cursor && cursor < range.end) cursor = std::min(to, range.end);
+            }
+            return cursor == to;
+        };
+        Require(covered(a, b + piece) && covered(c, c + piece), "the BDA table of a build that crossed a base region misses a leased range");
+        Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= begin && end <= range.end; }), "the range crossing two registered ranges is split in the BDA table");
+    };
+    const auto checkDistant = [&](const GuestBufferMemory& memory) {
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(c + 0x100, 64, adjustment);
+        const auto* import = ExistingHostImport(context, c, piece);
+        Require(import != nullptr && view.buffer == import->buffer && view.offset + adjustment == c + 0x100 - import->base, "a range the crossing range does not touch left its import");
+        const auto reads = memory.InPlaceReads();
+        Require(std::any_of(reads.begin(), reads.end(), [&](const auto& read) { return read.first <= c && c + piece <= read.second; }), "a range bound in place is not noted as read in place");
+    };
+
+    {
+        const auto before = AddressSpaceCounters();
+        GuestBufferMemory memory(context);
+        memory.AcquireRegistered();
+        Require(memory.HoldsLease(), "an address-based build holds no lease");
+        memory.AddWritable(b - half, 2 * half, false, false);
+        memory.AddReadable(c + 0x100, 64);
+        const auto after = AddressSpaceCounters();
+        if (local) Require(after.dissolvedLocal == before.dissolvedLocal + 1 && after.baseRegionsTaken == before.baseRegionsTaken + 2, "a range crossing two base regions did not take just those two");
+        else Require(after.dissolvedLocal == before.dissolvedLocal, "a local dissolve ran while disabled");
+        memory.Upload(true);
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(b - half, 2 * half, adjustment);
+        const auto copied = readBack(view, adjustment, 2 * half);
+        Require(std::all_of(copied.begin(), copied.begin() + half, [](std::byte value) { return value == std::byte{0x11}; }) && std::all_of(copied.begin() + half, copied.end(), [](std::byte value) { return value == std::byte{0x22}; }), "a view crossing two base regions misses their bytes");
+        checkTable(memory, b - half, b + half);
+        checkDistant(memory);
+        std::uint32_t insideAdjustment = 0;
+        Require(memory.Descriptor(b + 0x100, 64, insideAdjustment).buffer == view.buffer, "a view inside a base region the build took is not served by the region it merged into");
+        const auto* importA = ExistingHostImport(context, a, piece);
+        const bool inPlace = importA != nullptr && view.buffer == importA->buffer;
+        if (!inPlace) {
+            const auto reads = memory.InPlaceReads();
+            Require(std::none_of(reads.begin(), reads.end(), [&](const auto& read) { return read.first < b + half && b - half < read.second; }), "a base region the build copies is noted as read in place");
+        }
+        {
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment, 2 * half, 0x33333333u);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        memory.RecordCopyBacks(recorder);
+        settle();
+        memory.MarkDirectWrites();
+        memory.WriteBack();
+    }
+    recorder.Sync();
+    Require(std::all_of(second - half, second + half, [](std::byte value) { return value == std::byte{0x33}; }), "a write through a view crossing two base regions did not reach guest memory");
+    Require(std::all_of(first, second - half, [](std::byte value) { return value == std::byte{0x11}; }) && std::all_of(second + half, second + piece, [](std::byte value) { return value == std::byte{0x22}; }) && std::all_of(distant, distant + piece, [](std::byte value) { return value == std::byte{0x44}; }), "bytes outside a write crossing two base regions changed");
+
+    {
+        // A snapshot crossing the two, then a view inside a base region the build took.
+        std::vector<std::byte> captured(second - 16, second + 16);
+        const auto before = AddressSpaceCounters();
+        GuestBufferMemory memory(context);
+        memory.AcquireRegistered();
+        memory.AddSnapshot({b - 16, captured});
+        memory.AddReadable(a + 0x1000, 64);
+        memory.AddReadable(c + 0x100, 64);
+        if (local) Require(AddressSpaceCounters().dissolvedLocal == before.dissolvedLocal + 1, "a snapshot crossing two base regions did not take them");
+        memory.Upload(true);
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(a + 0x1000, 64, adjustment);
+        const auto inside = readBack(view, adjustment, 64);
+        Require(std::all_of(inside.begin(), inside.end(), [](std::byte value) { return value == std::byte{0x11}; }), "a view inside a base region the build took misses its bytes");
+        checkTable(memory, b - 16, b + 16);
+        checkDistant(memory);
+        memory.WriteBack();
+    }
+    recorder.Sync();
+    std::cout << "local dissolve: ok\n";
+    return true;
+}
+
 void hostImportUnmapTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -6077,6 +6241,9 @@ int main(int argc, char** argv) {
             if (!writtenBufferOrderTests(device, recorder)) return 77;
             std::cout << "written buffer order tests passed\n";
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--local-dissolve-only") {
+            return localDissolveTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--piecewise-copy-only") {
             return piecewiseGpuCopyTests(device, recorder) ? 0 : 77;
