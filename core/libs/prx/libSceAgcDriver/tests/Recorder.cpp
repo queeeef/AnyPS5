@@ -2937,6 +2937,115 @@ bool piecewiseGpuCopyTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+// Six ranges of alternating writability (no two continue a run), two crossings in one build, views
+// inside taken and kept base regions (some added before the crossing took theirs): every sampled
+// address reads the guest's bytes through its descriptor, and the BDA table maps it to the same
+// device memory the descriptor binds.
+bool localDissolveConsistency(const Device& device, Recorder& recorder, std::uint64_t window) {
+    const auto& context = device.GetContext();
+    const auto piece = static_cast<std::size_t>(std::max<VkDeviceSize>(1u << 16u, context.hostImportAlignment));
+    constexpr std::size_t count = 6;
+    const std::size_t span = 8 * piece;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, 2 * span, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(span, 2 * span);
+#endif
+    Require(block != nullptr, "cannot allocate the local dissolve consistency block");
+    const auto aligned = (reinterpret_cast<std::uint64_t>(block) + 4 * piece - 1) / (4 * piece) * (4 * piece);
+    std::vector<void*> registered;
+    struct Cleanup {
+        std::vector<void*>& registered;
+        void* block;
+        ~Cleanup() {
+            for (auto* pointer : registered) {
+                try {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(pointer);
+                } catch (...) {
+                }
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } cleanup{registered, block};
+    SetHostImportWindow(window);
+    const auto at = [&](std::size_t index) { return aligned + index * piece; };
+    for (std::size_t word = 0; word < count * piece / 4; ++word) reinterpret_cast<std::uint32_t*>(aligned)[word] = static_cast<std::uint32_t>(aligned + 4 * word) ^ 0x5a5a5a5au;
+    {
+        GuestAllocations::Mutation mutation;
+        for (std::size_t index = 0; index < count; ++index) {
+            auto* pointer = reinterpret_cast<void*>(at(index));
+            mutation.Add(pointer, piece, true, index % 2 == 0, true);
+            registered.push_back(pointer);
+        }
+    }
+    const auto deviceAddress = context.Function<PFN_vkGetBufferDeviceAddress>("vkGetBufferDeviceAddress");
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    {
+        GuestBufferMemory memory(context);
+        memory.AcquireRegistered();
+        memory.AddReadable(at(1) + 0x100, 64);
+        memory.AddWritable(at(2) + 0x200, 256);
+        memory.AddWritable(at(1) - 0x800, 0x1000);
+        memory.AddReadable(at(1) + 0x300, 64);
+        memory.AddReadable(at(4) - 0x40, 0x80);
+        memory.AddReadable(at(5) + 0x400, 64);
+        const std::vector<std::byte> captured(reinterpret_cast<const std::byte*>(at(3) - 8), reinterpret_cast<const std::byte*>(at(3) + 8));
+        memory.AddSnapshot({at(3) - 8, captured});
+        memory.Upload(true);
+        const auto ranges = memory.AddressRanges();
+        for (std::size_t index = 1; index < ranges.size(); ++index) Require(ranges[index - 1].end <= ranges[index].begin, "the BDA table of a build with two crossings overlaps itself");
+        std::vector<std::uint64_t> samples;
+        for (std::uint64_t address = at(0); address < at(count); address += 0x800) samples.push_back(address);
+        for (const auto address : {at(1) + 0x100, at(2) + 0x200, at(1) - 0x800, at(1) + 0x300, at(4) - 0x40, at(5) + 0x400, at(3) - 8, at(1) - 4, at(4) - 4}) samples.push_back(address);
+        constexpr std::size_t sample = 16;
+        auto readback = std::make_shared<Buffer>(context, samples.size() * sample, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        {
+            const auto commands = recorder.Commands();
+            recorder.Keep(readback);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            for (std::size_t index = 0; index < samples.size(); ++index) {
+                const auto address = samples[index];
+                std::uint32_t adjustment = 0;
+                const auto view = memory.Descriptor(address, sample, adjustment);
+                CopyBuffer(context, commands, view.buffer, view.offset + adjustment, readback->Handle(), index * sample, sample);
+                const auto entry = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address && address + sample <= range.end; });
+                Require(entry != ranges.end(), "a sampled address is not in the BDA table");
+                const VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, view.buffer};
+                if (entry->deviceAddress + (address - entry->begin) != deviceAddress(context.device, &info) + view.offset + adjustment) {
+                    char text[256];
+                    std::snprintf(text, sizeof(text), "window 0x%llx: the BDA table and the descriptor map piece %llu offset 0x%llx to different memory", static_cast<unsigned long long>(window), static_cast<unsigned long long>((address - at(0)) / piece), static_cast<unsigned long long>((address - at(0)) % piece));
+                    Require(false, text);
+                }
+            }
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        }
+        settle();
+        const auto bytes = readback->Bytes();
+        for (std::size_t index = 0; index < samples.size(); ++index) {
+            if (std::memcmp(bytes.data() + index * sample, reinterpret_cast<const void*>(samples[index]), sample) == 0) continue;
+            char text[256];
+            std::snprintf(text, sizeof(text), "window 0x%llx: the descriptor at piece %llu offset 0x%llx misses the guest's bytes", static_cast<unsigned long long>(window), static_cast<unsigned long long>((samples[index] - at(0)) / piece), static_cast<unsigned long long>((samples[index] - at(0)) % piece));
+            Require(false, text);
+        }
+        memory.RecordCopyBacks(recorder);
+        settle();
+        memory.MarkDirectWrites();
+        memory.WriteBack();
+    }
+    recorder.Sync();
+    for (std::size_t word = 0; word < count * piece / 4; ++word) Require(reinterpret_cast<const std::uint32_t*>(aligned)[word] == (static_cast<std::uint32_t>(aligned + 4 * word) ^ 0x5a5a5a5au), "a build with two crossings changed guest memory it did not write");
+    return true;
+}
+
 // An address-based build whose descriptor (or snapshot) crosses from one registered range into the
 // next, which does not continue its run: the build takes only the two base regions it crosses from
 // the cached address space (APS5_NO_LOCAL_DISSOLVE=1: all of them) and merges them with the range
@@ -3097,6 +3206,10 @@ bool localDissolveTests(const Device& device, Recorder& recorder) {
         memory.WriteBack();
     }
     recorder.Sync();
+    for (const std::uint64_t window : {std::uint64_t{0}, std::uint64_t{4 * piece}}) {
+        if (!localDissolveConsistency(device, recorder, window)) return false;
+    }
+    SetHostImportWindow(8ull << 20u);
     std::cout << "local dissolve: ok\n";
     return true;
 }
