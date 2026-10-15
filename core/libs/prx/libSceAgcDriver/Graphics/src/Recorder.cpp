@@ -3511,6 +3511,9 @@ namespace {
 // every such wait ([capsync] sync lines).
 struct SyncWaitSite {
     std::uint64_t count = 0;
+    // Of them, waits for a range a recent small DMA_DATA copy wrote on the GPU (NoteGpuDmaCopy).
+    std::uint64_t dmaCopied = 0;
+    double dmaCopiedMs = 0;
     std::uint64_t batchesToTarget = 0;
     std::uint64_t unsignaledAtStart = 0;
     std::uint64_t newest = 0;
@@ -3538,6 +3541,24 @@ bool TraceCapSync() {
     return trace;
 }
 
+// The last destinations of small DMA_DATA copies recorded on the GPU (touched under the GpuMutex).
+struct GpuDmaCopies {
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 256> ranges{};
+    std::size_t next = 0;
+};
+
+GpuDmaCopies& RecentGpuDmaCopies() {
+    static GpuDmaCopies copies;
+    return copies;
+}
+
+bool RecentGpuDmaOverlaps(std::uint64_t address, std::uint64_t end) {
+    for (const auto& [begin, last] : RecentGpuDmaCopies().ranges) {
+        if (begin < end && address < last) return true;
+    }
+    return false;
+}
+
 void ReportSyncWaits(SyncWaitStats& stats) {
     std::string report = "[syncwait] unlocked hook waits by read site (10 s; count/GPU wait, avg batches up to the target, avg of them unsignaled at the start, target was the newest submission, avg target submit-to-signal ms):";
     for (std::size_t site = 0; site < stats.bySite.size(); ++site) {
@@ -3546,6 +3567,10 @@ void ReportSyncWaits(SyncWaitStats& stats) {
         char text[160];
         std::snprintf(text, sizeof(text), " %s %llu/%.0fms %.1f %.1f %.0f%% %.1f", GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(site)), static_cast<unsigned long long>(entry.count), entry.waitedMs, static_cast<double>(entry.batchesToTarget) / entry.count, static_cast<double>(entry.unsignaledAtStart) / entry.count, entry.newest * 100.0 / entry.count, entry.targetAgeMs / entry.count);
         report += text;
+        if (entry.dmaCopied != 0) {
+            std::snprintf(text, sizeof(text), " (%llu/%.0fms on GPU-copied DMA bytes)", static_cast<unsigned long long>(entry.dmaCopied), entry.dmaCopiedMs);
+            report += text;
+        }
     }
     report += "; batches ahead by queue:";
     for (const auto& [queue, count] : stats.aheadByQueue) {
@@ -3599,6 +3624,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     const bool profile = DrawProfiled() || LocalWaitFrames();
     const bool trace = TraceCapSync();
     const auto readSite = GuestMemory::CurrentReadSite();
+    const bool dmaCopied = RecentGpuDmaOverlaps(address, end);
     const auto newestSerial = submissions;
     std::size_t batchesToTarget = 0, unsignaledAtStart = 0, targetRanges = 0;
     std::pair<std::uint64_t, std::uint64_t> hit{0, 0};
@@ -3657,6 +3683,10 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         auto& siteStats = stats.bySite[static_cast<std::size_t>(readSite)];
         ++siteStats.count;
         siteStats.waitedMs += ms;
+        if (dmaCopied) {
+            ++siteStats.dmaCopied;
+            siteStats.dmaCopiedMs += ms;
+        }
         siteStats.batchesToTarget += batchesToTarget;
         siteStats.unsignaledAtStart += unsignaledAtStart;
         if (targetSerial == newestSerial) ++siteStats.newest;
@@ -3906,6 +3936,12 @@ void Recorder::release(Batch& batch) noexcept {
     if (batch.fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, batch.fence, nullptr);
     batch.commands = VK_NULL_HANDLE;
     batch.fence = VK_NULL_HANDLE;
+}
+
+void NoteGpuDmaCopy(std::uint64_t address, std::size_t bytes) {
+    auto& copies = RecentGpuDmaCopies();
+    copies.ranges[copies.next] = {address, address + bytes};
+    copies.next = (copies.next + 1) % copies.ranges.size();
 }
 
 }

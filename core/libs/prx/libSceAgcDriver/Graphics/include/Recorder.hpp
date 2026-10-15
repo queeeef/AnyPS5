@@ -837,6 +837,10 @@ private:
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
 };
 
+// The destination of a small DMA_DATA copy recorded on the GPU (under the GpuMutex): the last few
+// are kept so the [syncwait] line can count the GPU waits of later CPU reads of their bytes.
+void NoteGpuDmaCopy(std::uint64_t address, std::size_t bytes);
+
 }
 
 #endif

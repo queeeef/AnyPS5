@@ -31,6 +31,9 @@ enum TrySite { TryLabel = 0, TryFlush, TryReap, TryPoll, TryIdle, TryCapture, Tr
 extern std::atomic<std::uint64_t> triesFailed[TrySites];
 
 extern std::atomic<std::uint64_t> storesOnGpu, storesBehindCompletions, storesOnCpu, storesDrained, copiesToHostMemory;
+// Small DMA_DATA copies whose source GPU work was still writing: copied on the GPU, or left to the
+// CPU read (no import for a range, or APS5_NO_GPU_SMALL_DMA=1).
+extern std::atomic<std::uint64_t> smallDmaOnGpu, smallDmaOnCpu;
 
 extern std::map<std::uint32_t, std::uint64_t> drainCounts;
 

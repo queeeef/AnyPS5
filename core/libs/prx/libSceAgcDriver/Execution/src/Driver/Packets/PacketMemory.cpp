@@ -112,7 +112,37 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
-        if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        // A small memory-to-memory DMA_DATA whose source recorded GPU work still writes: resolving it
+        // as a store reads the source on the CPU, which waits for that work (and every batch ahead of
+        // it). The GPU copies it instead, in queue order after the writes, as it does copies past the
+        // store limit below. Anything the GPU path refuses (a range without an import) still takes
+        // the store. APS5_NO_GPU_SMALL_DMA=1 keeps every small copy a store.
+        static const bool smallDmaGpu = std::getenv("APS5_NO_GPU_SMALL_DMA") == nullptr;
+        bool copiedOnGpu = false;
+        if (opcode == 0x50) {
+            const auto copy = Pm4::DecodeMemoryCopy(packet);
+            if (copy.has_value() && copy->bytes <= gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                auto* recorder = Graphics::Recorder::Active();
+                const auto localDevice = device.Load();
+                if (recorder != nullptr && localDevice != nullptr && recorder->PendingWriteOverlaps(copy->source, copy->bytes) && !recorder->PendingWriteSettled(copy->source, copy->bytes)) {
+                    if (smallDmaGpu) {
+                        recordDeferredLabels(localDevice.get(), submission.queue);
+                        const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                        if (outcome.path == 1 || outcome.path == 3) {
+                            Graphics::NoteGpuDmaCopy(copy->destination, copy->bytes);
+                            ++smallDmaOnGpu;
+                            wroteOnGpu = true;
+                            drained = false;
+                            copiedOnGpu = true;
+                        }
+                    }
+                    if (!copiedOnGpu) ++smallDmaOnCpu;
+                }
+            }
+        }
+        if (const auto store = copiedOnGpu ? std::nullopt : Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 
