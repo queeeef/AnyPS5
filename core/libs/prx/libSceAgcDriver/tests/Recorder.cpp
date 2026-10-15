@@ -2844,6 +2844,99 @@ bool hostImportReconcileTests(const Device& device) {
     return true;
 }
 
+// A written buffer region crossing the end of its registered range into the next, which does not
+// continue the run (another writability): no one import holds it, so the GPU copies each piece in
+// out of the import holding it and the written bytes back into each, as it does for one import.
+// The guest sees the shader's bytes with no CPU write-back, and nothing around the region changes.
+bool piecewiseGpuCopyTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: piecewise GPU copies not tested\n";
+        return false;
+    }
+    const auto piece = static_cast<std::size_t>(std::max<VkDeviceSize>(1u << 20u, context.hostImportAlignment));
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, 2 * piece, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(piece, 2 * piece);
+#endif
+    Require(block != nullptr, "cannot allocate the piecewise copy block");
+    auto* first = static_cast<std::byte*>(block);
+    auto* second = first + piece;
+    std::memset(first, 0x11, piece);
+    std::memset(second, 0x22, piece);
+    std::vector<void*> registered;
+    struct Cleanup {
+        const Context& context;
+        std::vector<void*>& registered;
+        void* block;
+        std::size_t bytes;
+        ~Cleanup() {
+            for (auto* pointer : registered) {
+                try {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(pointer);
+                } catch (...) {
+                }
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } cleanup{context, registered, block, piece};
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(first, piece, true, true, true);
+        registered.push_back(first);
+        mutation.Add(second, piece, true, false, true);
+        registered.push_back(second);
+    }
+    const auto address = reinterpret_cast<std::uint64_t>(second);
+    if (HostImportFor(context, address - piece, piece) == nullptr || HostImportFor(context, address, piece) == nullptr) {
+        std::cout << "host import of the piecewise copy ranges refused: piecewise GPU copies not tested\n";
+        return false;
+    }
+    constexpr std::size_t half = 32u << 10u;
+    const auto begin = address - half;
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    {
+        GuestBufferMemory memory(context);
+        memory.AddWritable(begin, 2 * half, false, true);
+        memory.Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(begin, 2 * half, adjustment);
+        Require(adjustment == 0, "the piecewise copied view is not aligned to its element");
+        auto readback = std::make_shared<Buffer>(context, 2 * half, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        {
+            const auto commands = recorder.Commands();
+            recorder.Keep(readback);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            CopyBuffer(context, commands, view.buffer, view.offset, readback->Handle(), 0, 2 * half);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset, 2 * half, 0x33333333u);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        memory.RecordCopyBacks(recorder);
+        settle();
+        const auto copied = readback->Bytes();
+        Require(std::all_of(copied.begin(), copied.begin() + half, [](std::byte value) { return value == std::byte{0x11}; }) && std::all_of(copied.begin() + half, copied.end(), [](std::byte value) { return value == std::byte{0x22}; }), "a region crossing its range's end was not copied in from both ranges");
+        const auto* guest = reinterpret_cast<const std::byte*>(begin);
+        Require(std::all_of(guest, guest + 2 * half, [](std::byte value) { return value == std::byte{0x33}; }), "a region crossing its range's end was not copied back on the GPU");
+        memory.MarkDirectWrites();
+    }
+    Require(std::all_of(first, first + piece - half, [](std::byte value) { return value == std::byte{0x11}; }) && std::all_of(second + half, second + piece, [](std::byte value) { return value == std::byte{0x22}; }), "bytes around a piecewise copied region changed");
+    recorder.Sync();
+    std::cout << "piecewise GPU copies: ok\n";
+    return true;
+}
+
 void hostImportUnmapTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -5984,6 +6077,9 @@ int main(int argc, char** argv) {
             if (!writtenBufferOrderTests(device, recorder)) return 77;
             std::cout << "written buffer order tests passed\n";
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--piecewise-copy-only") {
+            return piecewiseGpuCopyTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-reconcile-only") {
             gpu.unlock();

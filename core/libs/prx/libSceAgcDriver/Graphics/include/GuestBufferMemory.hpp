@@ -338,6 +338,16 @@ private:
         bool gpuCopy = false;
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
+        // A gpuCopy region crossing the end of its registered range, which no one import holds: the
+        // pieces copied out of (and back into) the import holding each, in address order;
+        // `copySource` is unused then.
+        struct CopyPiece {
+            std::uint64_t begin;
+            std::uint64_t end;
+            VkBuffer source;
+            std::uint64_t sourceBase;
+        };
+        std::vector<CopyPiece> copyPieces;
         bool copiedBack = false;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;

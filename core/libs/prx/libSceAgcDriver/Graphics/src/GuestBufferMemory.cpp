@@ -938,7 +938,16 @@ struct LocalImportReconcile {
     std::uint64_t smallLeases = 0;
     std::uint64_t fullLeases = 0;
     std::uint64_t rememberedByLog = 0;
+    std::uint64_t piecewiseCopies = 0;
 };
+
+// Whole-registry leases taken by uploads that hold none of their own ([local-import-reconcile]).
+std::atomic<std::uint64_t> uploadWholeLeases{0};
+
+bool piecewiseGpuCopies() {
+    static const bool disabled = std::getenv("APS5_NO_PIECEWISE_GPU_COPIES") != nullptr;
+    return !disabled;
+}
 
 LocalImportReconcile& localImportReconcile() {
     static LocalImportReconcile counters;
@@ -2412,7 +2421,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
                 const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
                 std::fprintf(stderr, "[local-import-lookups] 10 s: %llu HostImportFor calls, %llu fast hits, slow: %llu registry changed, %llu device changed, %llu not imported yet (%llu not covered by one registered run, %llu import refused); %llu remembered misses; %.1f ms in slow paths; registry generation advanced %llu; %zu imports\n", static_cast<unsigned long long>(lookups.calls), static_cast<unsigned long long>(lookups.hits), static_cast<unsigned long long>(lookups.staleGeneration), static_cast<unsigned long long>(lookups.staleDevice), static_cast<unsigned long long>(lookups.misses), static_cast<unsigned long long>(lookups.uncovered), static_cast<unsigned long long>(lookups.importFailed), static_cast<unsigned long long>(lookups.remembered), lookups.slowMs, static_cast<unsigned long long>(generation - lookups.generationAtWindow), state.imports.size());
                 auto& reconcile = localImportReconcile();
-                std::fprintf(stderr, "[local-import-reconcile] 10 s: %llu incremental (%llu imports checked, %llu retired), %llu full walks (%llu without the change log, %llu after a run-setting change), %llu coverage re-checks; leases: %llu around a range, %llu whole registry; %llu misses remembered across registry changes\n", static_cast<unsigned long long>(reconcile.incremental), static_cast<unsigned long long>(reconcile.checked), static_cast<unsigned long long>(reconcile.retired), static_cast<unsigned long long>(reconcile.full), static_cast<unsigned long long>(reconcile.fullNoLog), static_cast<unsigned long long>(reconcile.fullSettings), static_cast<unsigned long long>(reconcile.watchPasses), static_cast<unsigned long long>(reconcile.smallLeases), static_cast<unsigned long long>(reconcile.fullLeases), static_cast<unsigned long long>(reconcile.rememberedByLog));
+                std::fprintf(stderr, "[local-import-reconcile] 10 s: %llu incremental (%llu imports checked, %llu retired), %llu full walks (%llu without the change log, %llu after a run-setting change), %llu coverage re-checks; leases: %llu around a range, %llu whole registry, %llu whole registry by uploads; %llu misses remembered across registry changes; %llu regions copied piecewise on the GPU\n", static_cast<unsigned long long>(reconcile.incremental), static_cast<unsigned long long>(reconcile.checked), static_cast<unsigned long long>(reconcile.retired), static_cast<unsigned long long>(reconcile.full), static_cast<unsigned long long>(reconcile.fullNoLog), static_cast<unsigned long long>(reconcile.fullSettings), static_cast<unsigned long long>(reconcile.watchPasses), static_cast<unsigned long long>(reconcile.smallLeases), static_cast<unsigned long long>(reconcile.fullLeases), static_cast<unsigned long long>(uploadWholeLeases.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(reconcile.rememberedByLog), static_cast<unsigned long long>(reconcile.piecewiseCopies));
                 reconcile = LocalImportReconcile{};
                 lookups = LocalImportLookups{};
                 lookups.generationAtWindow = generation;
@@ -3405,8 +3414,55 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     const auto importRanges = [&]() -> const GuestAllocations::Lease& {
         if (!lease.empty()) return lease;
         if (space != nullptr) return space->lease;
-        if (acquired.empty()) acquired = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        if (acquired.empty()) {
+            acquired = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            uploadWholeLeases.fetch_add(1, std::memory_order_relaxed);
+        }
         return acquired;
+    };
+    // Without a lease of its own the upload reads the registry around one region at a time
+    // (leaseAround): what runCovers, an import's run and a joined run there read of a whole lease.
+    // The whole registry still serves an import that would retire another (retireImport places its
+    // shadowed results against it, see HostImportFor), or ranges too many to take around.
+    const bool ownLease = !lease.empty() || space != nullptr;
+    std::optional<GuestAllocations::Lease> around;
+    struct Ranges {
+        const GuestAllocations::Lease* ranges;
+        bool partial;
+    };
+    const auto rangesAround = [&](std::uint64_t begin, std::uint64_t end) -> Ranges {
+        if (!ownLease && acquired.empty() && incrementalImports()) {
+            around = leaseAround(begin, end);
+            if (around) return {&*around, true};
+        }
+        return {&importRanges(), false};
+    };
+    const auto reconcileImports = [&](HostImports& state) {
+        if (!importsStale(context, state)) return;
+        if (ownLease || !acquired.empty()) refreshImports(context, state, importRanges());
+        else refreshImports(context, state, {}, false);
+    };
+    const auto importCovering = [&](HostImports& state, std::uint64_t begin, std::uint64_t end) -> const HostImport* {
+        const auto found = rangesAround(begin, end);
+        if (!runCovers(*found.ranges, begin, end)) return nullptr;
+        if (found.partial && wouldRetireImport(state, importRun(*found.ranges, begin))) return importAllocation(context, state, begin, importRanges());
+        return importAllocation(context, state, begin, *found.ranges);
+    };
+    const auto joinCovering = [&](HostImports& state, std::uint64_t begin, std::uint64_t end) {
+        const auto found = rangesAround(begin, end);
+        if (runCovers(*found.ranges, begin, end)) return;
+        if (found.partial) {
+            // importJoined's run, widened over joined imports at its ends as it does.
+            auto low = begin;
+            auto high = end;
+            if (const auto* first = findImport(state, begin, begin + 1); first != nullptr && first->joined) low = first->base;
+            if (const auto* last = findImport(state, end - 1, end); last != nullptr && last->joined) high = last->base + last->bytes;
+            if (wouldRetireImport(state, joinedRun(*found.ranges, low, high))) {
+                static_cast<void>(importJoined(context, state, begin, end, importRanges()));
+                return;
+            }
+        }
+        static_cast<void>(importJoined(context, state, begin, end, *found.ranges));
     };
     // Sub-range mirrors were found by UploadPrepare, possibly long before this lock was taken: one
     // whose Range went meanwhile (the guest reprotected its image) is dropped as findMirror would
@@ -3429,12 +3485,12 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (importsStale(context, state)) refreshImports(context, state, importRanges());
+        reconcileImports(state);
         importsRefreshed = true;
         for (const auto& region : regions) {
             if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region)) continue;
-            if (findImport(state, region.begin, region.end) != nullptr || runCovers(importRanges(), region.begin, region.end)) continue;
-            static_cast<void>(importJoined(context, state, region.begin, region.end, importRanges()));
+            if (findImport(state, region.begin, region.end) != nullptr) continue;
+            joinCovering(state, region.begin, region.end);
         }
     }
     if (space != nullptr && context.hostImportAlignment != 0) {
@@ -3444,7 +3500,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         // pointer instead of trusting it.
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (importsStale(context, state)) refreshImports(context, state, importRanges());
+        reconcileImports(state);
         importsRefreshed = true;
         if (state.epoch != space->importsEpoch) {
             Spaces().dissolvedImports.fetch_add(1, std::memory_order_relaxed);
@@ -3464,6 +3520,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         if (!region.pending) continue;
         region.pending = false;
         const auto bytes = region.end - region.begin;
+        region.copyPieces.clear();
         if (region.mirror != nullptr) {
             // A writable sub-range mirror: refreshed here, where waiting for recorded work is allowed.
             // Read-only mirrors are never written back; a writable one is diffed for this sub-range
@@ -3475,7 +3532,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         }
         if (sparseHeapCandidate(region)) {
             const auto refreshStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const bool bound = bindSparseMirror(region, importRanges());
+            const bool bound = bindSparseMirror(region, *rangesAround(region.begin, region.end).ranges);
             if (profile) refreshUs += microsecondsSince(refreshStart);
             if (bound) continue;
         }
@@ -3485,7 +3542,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             std::lock_guard lock(state.mutex);
             // Imports are made on demand for the registered range around each region.
             if (!importsRefreshed) {
-                if (importsStale(context, state)) refreshImports(context, state, importRanges());
+                reconcileImports(state);
                 importsRefreshed = true;
             }
             // An import taken by UploadPrepare (or at the lease) is still the registry's unless one
@@ -3493,9 +3550,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
-            if (entry == nullptr) {
-                if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, importRanges());
-            }
+            if (entry == nullptr) entry = importCovering(state, region.begin, region.end);
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
             const bool staged = recorder != nullptr && stagingEligible(region, addressable);
@@ -3515,6 +3570,34 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
                 region.copySourceBase = entry->base;
+            } else if (entry == nullptr && recorder != nullptr && (staged || gpuCopyEligible(region)) && piecewiseGpuCopies()) {
+                // Crossing the end of its registered range, so no one import holds it: the GPU copies
+                // each piece out of the import holding it, as for one import, where the CPU copy
+                // would wait for every recorded write to the range. The pieces' imports are confirmed
+                // once the last was made (making one can retire another); otherwise the CPU copies.
+                std::vector<Region::CopyPiece> pieces;
+                for (auto cursor = region.begin; cursor < region.end;) {
+                    const auto* piece = findImport(state, cursor, cursor + 1);
+                    if (piece == nullptr) piece = importCovering(state, cursor, cursor + 1);
+                    if (piece == nullptr) {
+                        pieces.clear();
+                        break;
+                    }
+                    const auto pieceEnd = std::min(region.end, piece->base + piece->bytes);
+                    pieces.push_back({cursor, pieceEnd, piece->buffer, piece->base});
+                    cursor = pieceEnd;
+                }
+                const bool confirmed = pieces.size() > 1 && std::all_of(pieces.begin(), pieces.end(), [&](const Region::CopyPiece& piece) {
+                    const auto* current = findImport(state, piece.begin, piece.end);
+                    return current != nullptr && current->buffer == piece.source && current->base == piece.sourceBase;
+                });
+                if (confirmed) {
+                    copyOnGpu = true;
+                    region.deviceLocal = staged;
+                    region.copySource = VK_NULL_HANDLE;
+                    region.copyPieces = std::move(pieces);
+                    ++localImportReconcile().piecewiseCopies;
+                }
             }
         }
         if (region.direct != nullptr) {
@@ -3726,7 +3809,11 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
-        CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        if (inputSnapshot == nullptr && !region->copyPieces.empty()) {
+            for (const auto& piece : region->copyPieces) CopyBuffer(context, commands, piece.source, piece.begin - piece.sourceBase, region->buffer->Handle(), piece.begin - region->begin, piece.end - piece.begin);
+        } else {
+            CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        }
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -3805,7 +3892,15 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
             // would have stored there itself had the range been bindable.
-            CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            if (region.copyPieces.empty()) {
+                CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            } else {
+                for (const auto& piece : region.copyPieces) {
+                    const auto low = std::max(from, piece.begin);
+                    const auto high = std::min(to, piece.end);
+                    if (low < high) CopyBuffer(context, commands, region.buffer->Handle(), low - region.begin, piece.source, low - piece.sourceBase, high - low);
+                }
+            }
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
             if (profile) {
