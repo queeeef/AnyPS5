@@ -3530,6 +3530,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             for (const auto& patch : dataPatches) {
                 if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
+            LocalCountSnapshot(LocalSnapshotEvent::StorageMovedWords, override->size);
             selected.push_back(index);
             result->snapshots.push_back({0, std::move(buffer)});
             continue;
@@ -3540,19 +3541,33 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             address = override->address;
             size = override->size;
         } else {
-            if (!snapshotInPlace || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+            if (!snapshotInPlace || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) {
+                LocalCountSnapshot(LocalSnapshotEvent::StorageNotCandidate);
+                continue;
+            }
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            if (!direct) {
+                LocalCountSnapshot(LocalSnapshotEvent::StorageNotInPlace);
+                continue;
+            }
+            if (recorder.PendingWriteOverlaps(item.address, item.size)) {
+                LocalCountSnapshot(LocalSnapshotEvent::StoragePendingWrite);
+                continue;
+            }
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) {
+            LocalCountSnapshot(LocalSnapshotEvent::StorageOverBudget);
+            continue;
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+            LocalCountSnapshot(LocalSnapshotEvent::StorageCopied, bytes);
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
         }
         selected.push_back(index);

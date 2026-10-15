@@ -893,6 +893,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        else LocalCountSnapshot(LocalSnapshotEvent::InputNoGeneration);
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;
@@ -900,6 +901,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    LocalCountSnapshot(LocalSnapshotEvent::InputCopied, bytes);
     return copy;
 }
 
@@ -943,6 +945,7 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
     if (bytes < Recorder::KeptIndexRangeIndices * indexSize) {
+        LocalCountSnapshot(LocalSnapshotEvent::IndexSmallScan, bytes);
         indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
         return indices;
     }
@@ -953,6 +956,8 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
         indices.reused = true;
         return indices;
     }
+    if (generation == 0) LocalCountSnapshot(LocalSnapshotEvent::IndexNoGeneration);
+    LocalCountSnapshot(LocalSnapshotEvent::IndexScanned, bytes);
     indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
     recorder.KeepHighestIndex(address, bytes, use, generation, registryGeneration, indices.highest);
     return indices;

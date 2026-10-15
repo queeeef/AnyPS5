@@ -841,6 +841,22 @@ private:
 // are kept so the [syncwait] line can count the GPU waits of later CPU reads of their bytes.
 void NoteGpuDmaCopy(std::uint64_t address, std::size_t bytes);
 
+// Local measurement (WIP): outcomes of the per-draw snapshot and index-range caches, printed as
+// [local-draw-snapshots] every 10 s under APS5_PROFILE_DRAW.
+enum class LocalSnapshotEvent : std::uint8_t {
+    // ShaderResources::PrepareDrawBindings, per storage allocation.
+    StorageMovedWords, StorageNotCandidate, StorageNotInPlace, StoragePendingWrite, StorageOverBudget, StorageHit, StorageRefreshed, StorageCopied,
+    // Recorder::ReusableDrawSnapshot misses, storage and draw inputs apart.
+    StorageNoEntry, StorageRegistry, StorageShared, StorageChangedOther,
+    InputHit, InputNoEntry, InputRegistry, InputChanged, InputNoGeneration, InputCopied,
+    // KeepDrawSnapshot.
+    KeepRefused, KeepEvicted,
+    // InPlaceIndexRange.
+    IndexSmallScan, IndexHit, IndexNoEntry, IndexRegistry, IndexChanged, IndexNoGeneration, IndexScanned,
+    Count
+};
+void LocalCountSnapshot(LocalSnapshotEvent event, std::uint64_t bytes = 0);
+
 }
 
 #endif
