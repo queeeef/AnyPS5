@@ -2083,7 +2083,7 @@ void drawSnapshotEvictionTests(const Device& device) {
     const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto generation = CollectWrites(address, 4096);
     Require(generation != 0, "the watched block has no generation");
-    constexpr auto cap = Recorder::DrawSnapshotEntries;
+    const auto cap = Recorder::DrawSnapshotEntries();
     cache.KeepDrawSnapshot(address, 16, generation, registry, buffer, Recorder::SnapshotUse::Vertex);
     for (std::size_t size = 1; size <= cap; ++size) cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 1) == buffer, "a kept snapshot is not reusable");

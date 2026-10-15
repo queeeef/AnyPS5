@@ -2541,6 +2541,15 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
+std::size_t Recorder::DrawSnapshotEntries() {
+    static const std::size_t entries = [] {
+        const char* value = std::getenv("APS5_DRAW_SNAPSHOT_ENTRIES");
+        const auto parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{16384};
+    }();
+    return entries;
+}
+
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
     const bool storage = use == SnapshotUse::Storage;
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
@@ -2619,7 +2628,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
 void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
-    const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
+    const auto maxEntries = storage ? DrawSnapshotEntries() : DrawInputEntries;
     auto& pool = drawSnapshotPools[SnapshotPool(use)];
     if (generation == 0 || bytes > budget) {
         LocalCountSnapshot(LocalSnapshotEvent::KeepRefused);

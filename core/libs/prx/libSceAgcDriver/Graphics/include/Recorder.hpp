@@ -97,7 +97,10 @@ public:
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32, Index16Restart, Index32Restart };
     static constexpr std::size_t DrawSnapshotBudget = std::size_t{1024} << 20u;
-    static constexpr std::size_t DrawSnapshotEntries = 1024;
+    // The storage snapshot pool's entry cap: 16384, or APS5_DRAW_SNAPSHOT_ENTRIES. A frame of Palworld binds
+    // more distinct storage snapshots than the 1024 kept before, which evicted each one before its
+    // next frame reused it (the byte budget above still bounds the pool).
+    static std::size_t DrawSnapshotEntries();
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
