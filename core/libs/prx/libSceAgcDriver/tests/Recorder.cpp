@@ -2065,6 +2065,89 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+// A kept draw snapshot and index range survive a registry change elsewhere (the registry's change
+// log shows it did not touch them) and not one over their own range; APS5_NO_REGISTRY_RANGE_CHECK=1
+// drops them at any change, as before.
+bool registryElsewhereTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    using Use = Recorder::SnapshotUse;
+    constexpr std::size_t bytes = 65536;
+    void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: registry changes elsewhere not tested\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#ifdef _WIN32
+    void* elsewhere = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* elsewhere = std::aligned_alloc(bytes, bytes);
+#endif
+    Require(elsewhere != nullptr, "cannot allocate the range registered elsewhere");
+    std::vector<void*> registered;
+    struct Cleanup {
+        std::vector<void*>& registered;
+        void* elsewhere;
+        ~Cleanup() {
+            for (auto* pointer : registered) {
+                try {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(pointer);
+                } catch (...) {
+                }
+            }
+#ifdef _WIN32
+            VirtualFree(elsewhere, 0, MEM_RELEASE);
+#else
+            std::free(elsewhere);
+#endif
+        }
+    } cleanup{registered, elsewhere};
+    const auto add = [&](void* pointer) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(pointer, bytes, true, true, true);
+        registered.push_back(pointer);
+    };
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    Recorder cache(device.GetContext());
+    const auto buffer = std::make_shared<Buffer>(device.GetContext(), 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto keep = [&] {
+        const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto generation = CollectWrites(address, 4096);
+        Require(generation != 0, "the watched block has no generation");
+        cache.KeepDrawSnapshot(address, 64, generation, registry, buffer);
+        cache.KeepHighestIndex(address, 4096, Use::Index16, generation, registry, 7u);
+    };
+    const auto kept = [&] {
+        std::optional<std::uint32_t> highest;
+        const bool snapshot = cache.ReusableDrawSnapshot(address, 64) == buffer;
+        const bool index = cache.KnownHighestIndex(address, 4096, Use::Index16, highest) && highest == 7u;
+        Require(snapshot == index, "the snapshot and the index range disagree on a registry change");
+        return snapshot;
+    };
+    // The change log's first read only sets where the recorder's copy starts.
+    keep();
+    add(elsewhere);
+    static_cast<void>(kept());
+    keep();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(elsewhere);
+    }
+    registered.clear();
+    add(elsewhere);
+    const bool rangeChecks = std::getenv("APS5_NO_REGISTRY_RANGE_CHECK") == nullptr;
+    Require(kept() == rangeChecks, rangeChecks ? "a registry change elsewhere dropped a kept snapshot" : "a kept snapshot survived a registry change with range checks disabled");
+    keep();
+    add(block);
+    Require(!kept(), "a registration over a kept snapshot's range left it reusable");
+    std::cout << "registry changes elsewhere: ok\n";
+    return true;
+}
+
 void drawSnapshotEvictionTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     constexpr std::size_t bytes = 65536;
@@ -6401,6 +6484,10 @@ int main(int argc, char** argv) {
             drawDescriptorWriteTests(device, recorder);
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--registry-elsewhere-only") {
+            gpu.unlock();
+            return registryElsewhereTests(device) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-cap-only") {
             drawSnapshotCapTests(device, recorder);

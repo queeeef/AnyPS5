@@ -2541,6 +2541,72 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
+namespace {
+
+// The registry's changes after a generation, pulled from libc's change log
+// (GuestAllocationsChangedSince) into a copy touched only under the GpuMutex: every change after
+// `floor` up to `through` is in `changes`, ascending by generation.
+struct RegistryChangeLog {
+    std::uint64_t floor = 0;
+    std::uint64_t through = 0;
+    std::vector<std::array<std::uint64_t, 3>> changes;
+    std::vector<std::uint64_t> scratch;
+};
+
+RegistryChangeLog& RegistryChanges() {
+    static RegistryChangeLog log;
+    return log;
+}
+
+bool registryRangeChecks() {
+    static const bool disabled = std::getenv("APS5_NO_REGISTRY_RANGE_CHECK") != nullptr;
+    return !disabled;
+}
+
+// Whether no registry change after `since` touched [begin, end): a kept copy of the range is then
+// still of the range as it is mapped now, whatever the registry did elsewhere (APS5_NO_REGISTRY_RANGE_CHECK=1:
+// any change refuses it, as before). On success `checked` is the generation the answer holds through.
+bool RegistryUntouched(std::uint64_t since, std::uint64_t begin, std::uint64_t end, std::uint64_t& checked) {
+    const auto current = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    checked = current;
+    if (since == current) return true;
+    if (!registryRangeChecks() || since > current) return false;
+    auto& log = RegistryChanges();
+    if (log.through == 0) {
+        // Nothing is known before the first pull.
+        log.floor = log.through = current;
+        return false;
+    }
+    if (log.through < current) {
+        constexpr std::size_t Capacity = 4096;
+        log.scratch.resize(3 * Capacity);
+        std::size_t count = 0;
+        const auto reached = GuestAllocations::GuestAllocationsChangedSince_nid_postfix(log.through, log.scratch.data(), Capacity, &count);
+        if (count == SIZE_MAX) {
+            log.changes.clear();
+            log.floor = log.through = current;
+            return false;
+        }
+        for (std::size_t index = 0; index < count; ++index) log.changes.push_back({log.scratch[3 * index], log.scratch[3 * index + 1], log.scratch[3 * index + 2]});
+        log.through = reached;
+        constexpr std::size_t Kept = 16384;
+        if (log.changes.size() > Kept) {
+            const auto dropped = log.changes.size() - Kept / 2;
+            log.floor = log.changes[dropped - 1][0];
+            log.changes.erase(log.changes.begin(), log.changes.begin() + static_cast<std::ptrdiff_t>(dropped));
+        }
+    }
+    if (since < log.floor || log.through < current) return false;
+    const auto first = std::upper_bound(log.changes.begin(), log.changes.end(), since, [](std::uint64_t value, const std::array<std::uint64_t, 3>& change) { return value < change[0]; });
+    for (auto it = first; it != log.changes.end(); ++it) {
+        if ((*it)[1] < end && begin < (*it)[2]) return false;
+    }
+    checked = log.through;
+    return true;
+}
+
+}
+
 std::size_t Recorder::DrawSnapshotEntries() {
     static const std::size_t entries = [] {
         const char* value = std::getenv("APS5_DRAW_SNAPSHOT_ENTRIES");
@@ -2557,7 +2623,13 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
         LocalCountSnapshot(storage ? LocalSnapshotEvent::StorageNoEntry : LocalSnapshotEvent::InputNoEntry);
         return {};
     }
-    const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    // The kept copy's whole range (a vertex entry may be longer than asked for).
+    std::uint64_t checked = 0;
+    const bool sameRegistry = RegistryUntouched(found->second.registryGeneration, address, address + std::get<2>(found->first), checked);
+    if (sameRegistry && checked != found->second.registryGeneration) {
+        found->second.registryGeneration = checked;
+        LocalCountSnapshot(LocalSnapshotEvent::RegistryElsewhere);
+    }
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         const bool sole = found->second.buffer.use_count() == 1;
         if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
@@ -2660,8 +2732,14 @@ bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, Snaps
         LocalCountSnapshot(LocalSnapshotEvent::IndexNoEntry);
         return false;
     }
-    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
-        LocalCountSnapshot(found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() ? LocalSnapshotEvent::IndexRegistry : LocalSnapshotEvent::IndexChanged);
+    std::uint64_t checked = 0;
+    const bool sameRegistry = RegistryUntouched(found->second.registryGeneration, address, address + bytes, checked);
+    if (sameRegistry && checked != found->second.registryGeneration) {
+        found->second.registryGeneration = checked;
+        LocalCountSnapshot(LocalSnapshotEvent::RegistryElsewhere);
+    }
+    if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+        LocalCountSnapshot(!sameRegistry ? LocalSnapshotEvent::IndexRegistry : LocalSnapshotEvent::IndexChanged);
         indexRangeRecency.erase(found->second.recent);
         indexRanges.erase(found);
         return false;
@@ -4011,13 +4089,13 @@ void LocalCountSnapshot(LocalSnapshotEvent event, std::uint64_t bytes) {
     using E = LocalSnapshotEvent;
     const auto at = [&](E e) { return n[static_cast<std::size_t>(e)]; };
     const auto kb = [&](E e) { return kib[static_cast<std::size_t>(e)]; };
-    std::fprintf(stderr, "[local-draw-snapshots] 10 s: storage allocations: %llu moved words (%.0f KiB copied), not candidates %llu (not guest/written/overlapping writes), not in place %llu, pending GPU write %llu, over budget %llu; snapshots: %llu hits, %llu refreshed, %llu copied (%.0f KiB); storage misses: no entry %llu, registry changed %llu, changed while the buffer is in use %llu, changed other %llu; draw inputs: %llu hits, misses: no entry %llu, registry changed %llu, changed %llu, no generation %llu; %llu copied (%.0f KiB); keeps refused %llu, evicted %llu; index ranges: %llu small scans (%.0f KiB), %llu hits, misses: no entry %llu, registry changed %llu, changed %llu, no generation %llu (%.0f KiB scanned)\n",
+    std::fprintf(stderr, "[local-draw-snapshots] 10 s: storage allocations: %llu moved words (%.0f KiB copied), not candidates %llu (not guest/written/overlapping writes), not in place %llu, pending GPU write %llu, over budget %llu; snapshots: %llu hits, %llu refreshed, %llu copied (%.0f KiB); storage misses: no entry %llu, registry changed %llu, changed while the buffer is in use %llu, changed other %llu; draw inputs: %llu hits, misses: no entry %llu, registry changed %llu, changed %llu, no generation %llu; %llu copied (%.0f KiB); keeps refused %llu, evicted %llu; index ranges: %llu small scans (%.0f KiB), %llu hits, misses: no entry %llu, registry changed %llu, changed %llu, no generation %llu (%.0f KiB scanned); %llu kept entries left valid by registry changes elsewhere\n",
                  at(E::StorageMovedWords), kb(E::StorageMovedWords), at(E::StorageNotCandidate), at(E::StorageNotInPlace), at(E::StoragePendingWrite), at(E::StorageOverBudget),
                  at(E::StorageHit), at(E::StorageRefreshed), at(E::StorageCopied), kb(E::StorageCopied),
                  at(E::StorageNoEntry), at(E::StorageRegistry), at(E::StorageShared), at(E::StorageChangedOther),
                  at(E::InputHit), at(E::InputNoEntry), at(E::InputRegistry), at(E::InputChanged), at(E::InputNoGeneration), at(E::InputCopied), kb(E::InputCopied),
                  at(E::KeepRefused), at(E::KeepEvicted),
-                 at(E::IndexSmallScan), kb(E::IndexSmallScan), at(E::IndexHit), at(E::IndexNoEntry), at(E::IndexRegistry), at(E::IndexChanged), at(E::IndexNoGeneration), kb(E::IndexScanned));
+                 at(E::IndexSmallScan), kb(E::IndexSmallScan), at(E::IndexHit), at(E::IndexNoEntry), at(E::IndexRegistry), at(E::IndexChanged), at(E::IndexNoGeneration), kb(E::IndexScanned), at(E::RegistryElsewhere));
 }
 
 }

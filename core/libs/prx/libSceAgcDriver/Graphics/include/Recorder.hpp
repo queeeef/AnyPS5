@@ -856,6 +856,8 @@ enum class LocalSnapshotEvent : std::uint8_t {
     KeepRefused, KeepEvicted,
     // InPlaceIndexRange.
     IndexSmallScan, IndexHit, IndexNoEntry, IndexRegistry, IndexChanged, IndexNoGeneration, IndexScanned,
+    // A kept snapshot, draw input or index range that registry changes elsewhere left valid.
+    RegistryElsewhere,
     Count
 };
 void LocalCountSnapshot(LocalSnapshotEvent event, std::uint64_t bytes = 0);
