@@ -1,0 +1,7 @@
+- [Palworld on AnyPS5 testing](palworld-anyps5-testing.md) — repo, branches, run dirs, current progress
+- [Verify with real input](anyps5-feedback-verify-with-input.md) — idle runs prove nothing; crashes are on later screens
+- [AGC architecture review 2026-10-14](anyps5-architecture-review-2026-10-14.md) — defects D1-D4, measured frame split, current best build H6Y/H6Z, design doc path
+- [GPU tests black out the display](anyps5-gpu-tests-share-display.md) — device-lost tests reset the user's display driver; ask before repeating
+- [Check prior experiments first](anyps5-feedback-check-prior-experiments.md) — grep the testing log before proposing; I repeated failed H3 once
+- [Ask before deviating from a step](anyps5-feedback-ask-before-deviating.md) — show data, ask before switching an approved step
+- [Upstream review 2026-10-28](anyps5-upstream-review-2026-10-28.md) — play2-h5 vs upstream main: overlaps, what is ours only, port-not-rebase plan
