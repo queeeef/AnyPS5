@@ -28,6 +28,7 @@ bool isLaneLocal(IrOpcode opcode) {
         case IrOpcode::IMul32:
         case IrOpcode::SelectU1:
         case IrOpcode::SelectU32:
+        case IrOpcode::SelectRareU32:
         case IrOpcode::SelectF32:
         case IrOpcode::BitCastU16F16:
         case IrOpcode::BitCastF16U16:

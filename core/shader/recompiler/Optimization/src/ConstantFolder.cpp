@@ -333,7 +333,8 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
         case IrOpcode::Phi: return foldPhi(value);
         case IrOpcode::SelectU1:
         case IrOpcode::SelectF32:
-        case IrOpcode::SelectU32: return foldSelect(value);
+        case IrOpcode::SelectU32:
+        case IrOpcode::SelectRareU32: return foldSelect(value);
         case IrOpcode::BitFieldInsert: {
             auto& base = resolveArg(value, 0);
             auto& insert = resolveArg(value, 1);

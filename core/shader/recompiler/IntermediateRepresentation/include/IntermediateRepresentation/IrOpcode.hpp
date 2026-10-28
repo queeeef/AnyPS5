@@ -476,6 +476,7 @@ enum class IrOpcode : std::uint16_t {
     TtraceData,
     InstPrefetch,
     SelectU32,
+    SelectRareU32,
     ImageBvhIntersectRay,
     Count
 };
